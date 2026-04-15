@@ -151,18 +151,21 @@ def _is_gateway_approval_context() -> bool:
     return bool(_get_session_platform())
 
 # Sensitive write targets that should trigger approval even when referenced
-# via shell expansions like $HOME or $HERMES_HOME, or by the resolved absolute
-# active profile home path such as /home/hermes/.hermes/config.yaml. The
-# resolved-absolute form is folded into the ~/.hermes/ patterns at detection
-# time by _normalize_command_for_detection() — see the rewrite step there — so
-# these static patterns stay free of any import-time path snapshot (which would
-# go stale when HERMES_HOME is set after this module is imported, e.g. under the
-# hermetic test conftest or any deferred-profile-resolution path).
-_SSH_SENSITIVE_PATH = r'(?:~|\$home|\$\{home\})/\.ssh(?:/|$)'
+# via shell expansions like $HOME or $HERMES_HOME. Hermes profile-home paths
+# are normalized by _normalize_command_for_detection(), while .ssh writes are
+# also caught when referenced through explicit absolute paths.
+_SSH_SENSITIVE_PATH = (
+    r'(?:'
+    r'(?:~|\$home|\$\{home\})/\.ssh'
+    r'|'
+    r'/(?:[^\s/"\']+/)*\.ssh'
+    r')(?:/|$)'
+)
 _HERMES_ENV_PATH = (
     r'(?:~\/\.hermes/|'
     r'(?:\$home|\$\{home\})/\.hermes/|'
-    r'(?:\$hermes_home|\$\{hermes_home\})/)'
+    r'(?:\$hermes_home|\$\{hermes_home\})/|'
+    r'/(?:[^\s/"\']+/)*\.hermes/)'
     r'\.env\b'
 )
 # ~/.hermes/config.yaml IS the security policy: approvals.mode, yolo, and the

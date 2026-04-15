@@ -53,13 +53,20 @@ def get_current_session_key(default: str = "default") -> str:
     from gateway.session_context import get_session_env
     return get_session_env("HERMES_SESSION_KEY", default)
 
-# Sensitive write targets that should trigger approval even when referenced
-# via shell expansions like $HOME or $HERMES_HOME.
-_SSH_SENSITIVE_PATH = r'(?:~|\$home|\$\{home\})/\.ssh(?:/|$)'
+# Sensitive write targets that should trigger approval for both shell
+# expansions ($HOME/$HERMES_HOME) and explicit absolute paths.
+_SSH_SENSITIVE_PATH = (
+    r'(?:'
+    r'(?:~|\$home|\$\{home\})/\.ssh'
+    r'|'
+    r'/(?:[^\s/"\']+/)*\.ssh'
+    r')(?:/|$)'
+)
 _HERMES_ENV_PATH = (
     r'(?:~\/\.hermes/|'
     r'(?:\$home|\$\{home\})/\.hermes/|'
-    r'(?:\$hermes_home|\$\{hermes_home\})/)'
+    r'(?:\$hermes_home|\$\{hermes_home\})/|'
+    r'/(?:[^\s/"\']+/)*\.hermes/)'
     r'\.env\b'
 )
 _SENSITIVE_WRITE_TARGET = (

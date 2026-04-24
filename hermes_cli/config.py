@@ -466,6 +466,12 @@ DEFAULT_CONFIG = {
         "record_sessions": False,  # Auto-record browser sessions as WebM videos
         "allow_private_urls": False,  # Allow navigating to private/internal IPs (localhost, 192.168.x.x, etc.)
         "cdp_url": "",  # Optional persistent CDP endpoint for attaching to an existing Chromium/Chrome
+        # CDP supervisor — dialog + frame detection via a persistent WebSocket.
+        # Active only when a CDP-capable backend is attached (Browserbase or
+        # local Chrome via /browser connect). See
+        # website/docs/developer-guide/browser-supervisor.md.
+        "dialog_policy": "must_respond",  # must_respond | auto_dismiss | auto_accept
+        "dialog_timeout_s": 300,  # Safety auto-dismiss after N seconds under must_respond
         "camofox": {
             # When true, Hermes sends a stable profile-scoped userId to Camofox
             # so the server maps it to a persistent Firefox profile automatically.
@@ -486,7 +492,27 @@ DEFAULT_CONFIG = {
     # exceed this are rejected with guidance to use offset+limit.
     # 100K chars ≈ 25–35K tokens across typical tokenisers.
     "file_read_max_chars": 100_000,
-    
+
+    # Tool-output truncation thresholds. When terminal output or a
+    # single read_file page exceeds these limits, Hermes truncates the
+    # payload sent to the model (keeping head + tail for terminal,
+    # enforcing pagination for read_file). Tuning these trades context
+    # footprint against how much raw output the model can see in one
+    # shot. Ported from anomalyco/opencode PR #23770.
+    #
+    # - max_bytes:       terminal_tool output cap, in chars
+    #                    (default 50_000 ≈ 12-15K tokens).
+    # - max_lines:       read_file pagination cap — the maximum `limit`
+    #                    a single read_file call can request before
+    #                    being clamped (default 2000).
+    # - max_line_length: per-line cap applied when read_file emits a
+    #                    line-numbered view (default 2000 chars).
+    "tool_output": {
+        "max_bytes": 50_000,
+        "max_lines": 2000,
+        "max_line_length": 2000,
+    },
+
     "compression": {
         "enabled": True,
         "threshold": 0.50,            # compress when context usage exceeds this ratio
@@ -739,6 +765,10 @@ DEFAULT_CONFIG = {
         "inherit_mcp_toolsets": True,
         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
+        "child_timeout_seconds": 600,  # wall-clock timeout for each child agent (floor 30s,
+                                       # no ceiling). High-reasoning models on large tasks
+                                       # (e.g. gpt-5.5 xhigh, opus-4.6) need generous budgets;
+                                       # raise if children time out before producing output.
         "reasoning_effort": "",  # reasoning effort for subagents: "xhigh", "high", "medium",
                                  # "low", "minimal", "none" (empty = inherit parent's level)
         "max_concurrent_children": 3,  # max parallel children per batch; floor of 1 enforced, no ceiling

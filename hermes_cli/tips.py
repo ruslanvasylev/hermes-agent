@@ -100,13 +100,16 @@ TIPS = [
     "hermes gateway install sets up Hermes as a system service (systemd/launchd).",
     "hermes memory setup lets you configure an external memory provider (Honcho, Mem0, etc.).",
     "hermes webhook subscribe creates event-driven webhook routes with HMAC validation.",
+    "Save money: hermes tools disables unused tools, hermes skills config trims skills down.",
+    "/reasoning low or /reasoning minimal cuts thinking depth below the default (medium) — faster, cheaper responses.",
+    "hermes models routes vision, compression, and aux tasks to cheaper models — cuts background token cost 85%+ without downgrading your main chat model.",
 
     # --- Configuration ---
     "Set display.bell_on_complete: true in config.yaml to hear a bell when long tasks finish.",
     "Set display.streaming: true to see tokens appear in real time as the model generates.",
     "Set display.show_reasoning: true to watch the model's chain-of-thought reasoning.",
     "Set display.compact: true to reduce whitespace in output for denser information.",
-    "Set display.busy_input_mode: queue to queue messages instead of interrupting the agent.",
+    "Set display.busy_input_mode: queue to queue messages instead of interrupting the agent, or steer to inject them mid-run via /steer.",
     "Set display.resume_display: minimal to skip the full conversation recap on session resume.",
     "Set compression.threshold: 0.50 to control when auto-compression fires (default: 50% of context).",
     "Set agent.max_turns: 200 to let the agent take more tool-calling steps per turn.",
@@ -263,7 +266,6 @@ TIPS = [
     "hermes status --deep runs deeper diagnostic checks across all components.",
 
     # --- Hidden Gems & Power-User Tricks ---
-    "BOOT.md at ~/.hermes/BOOT.md runs automatically on every gateway start — use it for startup checks.",
     "Cron jobs can attach a Python script (--script) whose stdout is injected into the prompt as context.",
     "Cron scripts live in ~/.hermes/scripts/ and run before the agent — perfect for data collection pipelines.",
     "prefill_messages_file in config.yaml injects few-shot examples into every API call, never saved to history.",

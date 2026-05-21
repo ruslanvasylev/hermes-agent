@@ -915,10 +915,20 @@ DEFAULT_CONFIG = {
             "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
             "extra_body": {},
         },
-        # Note: session_search no longer uses an auxiliary LLM (PR #27590 —
-        # single-shape tool returns DB content directly). The old
-        # ``auxiliary.session_search.*`` block was removed here. Existing
-        # values in user config.yaml files are harmless leftovers and ignored.
+        # session_search no longer uses an auxiliary LLM (PR #27590 —
+        # single-shape tool returns DB content directly), but keep a default
+        # block so the auxiliary config UI and legacy config merge paths remain
+        # schema-stable. Existing values in user config.yaml files are harmless
+        # leftovers and ignored by the tool.
+        "session_search": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 30,
+            "max_concurrency": 3,
+            "extra_body": {},
+        },
         "skills_hub": {
             "provider": "auto",
             "model": "",

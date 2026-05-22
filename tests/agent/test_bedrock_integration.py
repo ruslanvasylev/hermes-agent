@@ -150,10 +150,20 @@ class TestRuntimeProvider:
         assert "bedrock-runtime.eu-west-1.amazonaws.com" in result["base_url"]
         assert result["api_key"] == "aws-sdk"
 
-    def test_bedrock_runtime_default_region(self, monkeypatch):
+    def test_bedrock_runtime_default_region(self, monkeypatch, tmp_path):
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
+        # Isolate this default-region assertion from the developer machine's
+        # ~/.aws/config. resolve_bedrock_region intentionally honors boto3's
+        # configured profile region when present; this test covers only the
+        # hard fallback when no region source exists.
+        aws_config = tmp_path / "aws-config"
+        aws_credentials = tmp_path / "aws-credentials"
+        aws_config.write_text("[profile default]\n", encoding="utf-8")
+        aws_credentials.write_text("", encoding="utf-8")
         monkeypatch.setenv("AWS_PROFILE", "default")
+        monkeypatch.setenv("AWS_CONFIG_FILE", str(aws_config))
+        monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(aws_credentials))
         monkeypatch.delenv("AWS_REGION", raising=False)
         monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
 

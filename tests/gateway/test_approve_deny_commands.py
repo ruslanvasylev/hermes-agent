@@ -361,11 +361,20 @@ class TestBlockingApprovalE2E:
 
     def setup_method(self):
         _clear_approval_state()
+        self._old_tirith_enabled = os.environ.get("TIRITH_ENABLED")
+        os.environ["TIRITH_ENABLED"] = "0"
         os.environ.pop("HERMES_YOLO_MODE", None)
         os.environ.pop("HERMES_INTERACTIVE", None)
         os.environ.pop("HERMES_GATEWAY_SESSION", None)
         os.environ.pop("HERMES_EXEC_ASK", None)
         os.environ.pop("HERMES_SESSION_KEY", None)
+
+    def teardown_method(self):
+        if self._old_tirith_enabled is None:
+            os.environ.pop("TIRITH_ENABLED", None)
+        else:
+            os.environ["TIRITH_ENABLED"] = self._old_tirith_enabled
+        _clear_approval_state()
 
     def test_blocking_approval_approve_once(self):
         """check_all_command_guards blocks until resolve_gateway_approval is called."""
@@ -390,7 +399,7 @@ class TestBlockingApprovalE2E:
             os.environ["HERMES_SESSION_KEY"] = session_key
             try:
                 result_holder[0] = check_all_command_guards(
-                    "rm -rf /important", "local"
+                    "git reset --hard HEAD", "local"
                 )
             finally:
                 os.environ.pop("HERMES_GATEWAY_SESSION", None)
@@ -407,7 +416,7 @@ class TestBlockingApprovalE2E:
             time.sleep(0.05)
 
         assert len(notified) == 1
-        assert "rm -rf /important" in notified[0]["command"]
+        assert "git reset --hard HEAD" in notified[0]["command"]
 
         resolve_gateway_approval(session_key, "once")
         t.join(timeout=5)
@@ -438,7 +447,7 @@ class TestBlockingApprovalE2E:
             os.environ["HERMES_SESSION_KEY"] = session_key
             try:
                 result_holder[0] = check_all_command_guards(
-                    "rm -rf /important", "local"
+                    "git reset --hard HEAD", "local"
                 )
             finally:
                 os.environ.pop("HERMES_GATEWAY_SESSION", None)
@@ -483,7 +492,7 @@ class TestBlockingApprovalE2E:
                 with patch("tools.approval._get_approval_config",
                            return_value={"gateway_timeout": 1}):
                     result_holder[0] = check_all_command_guards(
-                        "rm -rf /important", "local"
+                        "git reset --hard HEAD", "local"
                     )
             finally:
                 os.environ.pop("HERMES_GATEWAY_SESSION", None)
@@ -639,7 +648,7 @@ class TestFallbackNoCallback:
         os.environ["HERMES_EXEC_ASK"] = "1"
         os.environ["HERMES_SESSION_KEY"] = "no-callback-test"
         try:
-            result = check_all_command_guards("rm -rf /important", "local")
+            result = check_all_command_guards("git reset --hard HEAD", "local")
         finally:
             os.environ.pop("HERMES_EXEC_ASK", None)
             os.environ.pop("HERMES_SESSION_KEY", None)

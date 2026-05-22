@@ -1561,7 +1561,7 @@ def test_normalize_codex_response_ignores_tool_call_text_when_real_tool_call_pre
 def test_normalize_codex_response_no_leak_passes_through(monkeypatch):
     """Sanity: normal assistant content that doesn't contain the leak pattern
     is returned verbatim with finish_reason=stop."""
-    agent = _build_agent(monkeypatch)
+    _patch_agent_bootstrap(monkeypatch)
     from agent.codex_responses_adapter import _normalize_codex_response
 
     response = SimpleNamespace(

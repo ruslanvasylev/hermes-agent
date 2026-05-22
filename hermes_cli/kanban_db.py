@@ -5744,6 +5744,15 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    target_task_id: Optional[str] = None
+    """Optional task id requested by a target-bound dispatcher tick."""
+    target_miss_reason: Optional[str] = None
+    """Why a target-bound dispatcher tick did not spawn the requested task.
+
+    ``None`` means no target was requested, or the target was eligible and
+    spawned/planned. Values are intentionally compact and stable for JSON
+    automation callers.
+    """
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -6942,6 +6951,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    target_task_id: Optional[str] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -6976,6 +6986,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            target_task_id=target_task_id,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -6992,6 +7003,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            target_task_id=target_task_id,
         )
 
 
@@ -7008,6 +7020,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    target_task_id: Optional[str] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -7036,12 +7049,25 @@ def _dispatch_once_locked(
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
+    ``target_task_id`` makes the spawn phase target-bound: after normal
+    housekeeping, only that exact task may be planned/spawned. Broad ready
+    queue ordering is ignored so automation can preflight one card without a
+    TOCTOU window where another ready card sorts earlier and gets spawned.
     """
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
 
     result = DispatchResult()
+    if target_task_id is None:
+        normalized_target_task_id = None
+    else:
+        normalized_target_task_id = str(target_task_id).strip()
+    result.target_task_id = normalized_target_task_id
+    if target_task_id is not None and not normalized_target_task_id:
+        result.target_miss_reason = "invalid_target"
+        return result
+    target_task_id = normalized_target_task_id
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
@@ -7081,11 +7107,25 @@ def _dispatch_once_locked(
             ).fetchone()[0]
         )
 
-    ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
+    if target_task_id:
+        target_row = conn.execute(
+            "SELECT id, assignee, status, claim_lock FROM tasks WHERE id = ?",
+            (target_task_id,),
+        ).fetchone()
+        if target_row is None:
+            result.target_miss_reason = "not_found"
+            return result
+        if target_row["status"] != "ready" or target_row["claim_lock"]:
+            result.target_miss_reason = "not_ready"
+            return result
+        ready_rows = [target_row]
+    else:
+        ready_rows = conn.execute(
+            "SELECT id, assignee FROM tasks "
+            "WHERE status = 'ready' AND claim_lock IS NULL "
+            "ORDER BY priority DESC, created_at ASC"
+        ).fetchall()
+
     # Honour kanban.max_in_progress: if the board already has enough running
     # tasks, skip spawning this tick so slow workers (local LLMs,
     # resource-constrained hosts) can finish what they have before more tasks
@@ -7095,6 +7135,8 @@ def _dispatch_once_locked(
             "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
         ).fetchone()[0]
         if in_progress >= max_in_progress:
+            if target_task_id:
+                result.target_miss_reason = "capacity"
             return result
         # Only spawn enough to reach the cap, respecting max_spawn too.
         remaining = max_in_progress - in_progress
@@ -7139,6 +7181,8 @@ def _dispatch_once_locked(
             _default_assignee_resolved = True
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
+            if target_task_id:
+                result.target_miss_reason = "capacity"
             break
         row_assignee = row["assignee"]
         if not row_assignee:
@@ -7183,6 +7227,8 @@ def _dispatch_once_locked(
                 result.auto_assigned_default.append(row["id"])
             else:
                 result.skipped_unassigned.append(row["id"])
+                if target_task_id:
+                    result.target_miss_reason = "unassigned"
                 continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
@@ -7206,6 +7252,8 @@ def _dispatch_once_locked(
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
+            if target_task_id:
+                result.target_miss_reason = "nonspawnable"
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -7219,6 +7267,8 @@ def _dispatch_once_locked(
                 result.skipped_per_profile_capped.append(
                     (row["id"], row_assignee, current)
                 )
+                if target_task_id:
+                    result.target_miss_reason = "capacity"
                 continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
@@ -7231,6 +7281,8 @@ def _dispatch_once_locked(
         guard_reason = check_respawn_guard(conn, row["id"])
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
+            if target_task_id:
+                result.target_miss_reason = guard_reason
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
@@ -7254,6 +7306,8 @@ def _dispatch_once_locked(
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            if target_task_id:
+                result.target_miss_reason = "claim_lost"
             continue
         try:
             resolved_branch_name = None
@@ -7268,6 +7322,8 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            if target_task_id:
+                result.target_miss_reason = "workspace_error"
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
@@ -7313,6 +7369,11 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            if target_task_id:
+                result.target_miss_reason = "spawn_failed"
+
+    if target_task_id:
+        return result
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
@@ -7394,6 +7455,8 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            if target_task_id:
+                result.target_miss_reason = "spawn_failed"
     return result
 
 

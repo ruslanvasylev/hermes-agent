@@ -357,8 +357,12 @@ class TestTryRecoverPrimaryTransport:
             agent._try_recover_primary_transport(
                 error, retry_count=3, max_retries=3,
             )
-            # wait_time = min(3 + retry_count, 8) = min(6, 8) = 6
-            mock_sleep.assert_called_once_with(6)
+            # wait_time = min(3 + retry_count, 8) = min(6, 8) = 6.
+            # Background helper threads can also touch the module-global
+            # time.sleep while this patch is active on slower CI workers, so
+            # assert the recovery wait occurred without requiring it to be the
+            # only observed sleep call.
+            mock_sleep.assert_any_call(6)
 
     def test_wait_time_capped_at_8(self):
         agent = _make_agent(provider="custom")
@@ -369,8 +373,10 @@ class TestTryRecoverPrimaryTransport:
             agent._try_recover_primary_transport(
                 error, retry_count=10, max_retries=3,
             )
-            # wait_time = min(3 + 10, 8) = 8
-            mock_sleep.assert_called_once_with(8)
+            # wait_time = min(3 + 10, 8) = 8.
+            # See the scaling assertion above for why this is not
+            # assert_called_once_with on CI.
+            mock_sleep.assert_any_call(8)
 
     def test_closes_existing_client_before_rebuild(self):
         agent = _make_agent(provider="custom")

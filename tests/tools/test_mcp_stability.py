@@ -168,7 +168,10 @@ class TestStdioPidTracking:
         mock_kill.assert_any_call(fake_pid, signal.SIGTERM)
         mock_kill.assert_any_call(fake_pid, fake_sigkill)
         assert mock_kill.call_count == 2
-        mock_sleep.assert_called_once_with(2)
+        # Other helper threads can observe the module-global time.sleep patch
+        # on busy xdist CI workers; assert the orphan cleanup escalation wait
+        # occurred without requiring it to be the only observed sleep call.
+        mock_sleep.assert_any_call(2)
 
         with _lock:
             assert fake_pid not in _orphan_stdio_pids

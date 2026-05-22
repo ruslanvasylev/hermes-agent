@@ -236,6 +236,35 @@ the old standalone daemon alive for one release cycle, but running both
 a gateway-embedded dispatcher AND a standalone daemon against the same
 `kanban.db` causes claim races and is not supported.
 
+### Target-bound dispatch (for governed automation)
+
+`hermes kanban dispatch` without `--task-id` is a board sweep: it picks ready
+assigned tasks in priority/creation order up to the live `--max` concurrency
+cap. Automation that has already verified one specific card should use the
+target-bound form instead:
+
+```bash
+hermes kanban dispatch --task-id t_abcd --max 1 --json
+```
+
+With `--task-id`, the dispatcher still performs the normal housekeeping pass
+(reclaim stale/crashed/timed-out workers and promote dependencies), but the
+spawn phase may only plan or claim that exact task. If another ready card sorts
+earlier, it remains untouched. JSON output includes:
+
+- `target_task_id` — the requested task id.
+- `target_miss_reason` — `null` when the target was eligible and
+  planned/spawned; otherwise a compact reason such as `not_found`, `not_ready`,
+  `unassigned`, `nonspawnable`, `capacity`, `claim_lost`, `workspace_error`,
+  `spawn_failed`, `invalid_target`, or a respawn-guard reason (`blocker_auth`,
+  `recent_success`, `active_pr`).
+
+Use `--dry-run --task-id <id> --json` to prove the exact task would be selected
+without claiming it or spawning a worker. Dry-run still performs the dispatcher's
+normal housekeeping pass first, so stale/crashed/timed-out workers may be
+reclaimed and dependencies may be promoted before the target-selection result is
+reported.
+
 ### Idempotent create (for automation / webhooks)
 
 ```bash

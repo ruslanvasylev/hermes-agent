@@ -131,6 +131,14 @@ def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
     return branch
 
 
+def _parse_task_id_flag(value: str) -> str:
+    """Parse an explicit task-id CLI argument, failing closed on blanks."""
+    v = str(value or "").strip()
+    if not v:
+        raise argparse.ArgumentTypeError("task id must not be empty")
+    return v
+
+
 def _check_dispatcher_presence() -> tuple[bool, str]:
     """Return ``(running, message)``.
 
@@ -627,6 +635,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                         help="Don't actually spawn processes; just print what would happen")
     p_disp.add_argument("--max", type=int, default=None,
                         help="Cap number of spawns this pass")
+    p_disp.add_argument("--task-id", default=None, type=_parse_task_id_flag,
+                        help="Target-bound dispatch: only plan/spawn this exact ready task id")
     p_disp.add_argument("--failure-limit", type=int,
                         default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
                         help=f"Auto-block a task after this many consecutive non-success attempts "
@@ -2146,6 +2156,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            target_task_id=getattr(args, "task_id", None),
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2166,6 +2177,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "target_task_id": res.target_task_id,
+            "target_miss_reason": res.target_miss_reason,
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2203,6 +2216,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    if res.target_task_id:
+        if res.target_miss_reason:
+            print(f"Target:       {res.target_task_id} ({res.target_miss_reason})")
+        else:
+            print(f"Target:       {res.target_task_id} (eligible)")
     return 0
 
 

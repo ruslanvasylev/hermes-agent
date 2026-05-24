@@ -126,6 +126,53 @@ def test_run_slash_dispatch_dry_run_counts(kanban_home):
     assert "Spawned:" in out
 
 
+def test_dispatch_parser_accepts_target_task_id():
+    parser = argparse.ArgumentParser()
+    subcommands = parser.add_subparsers(dest="command")
+    kc.build_parser(subcommands)
+    args = parser.parse_args(["kanban", "dispatch", "--task-id", "t_target", "--json"])
+    assert args.command == "kanban"
+    assert args.kanban_action == "dispatch"
+    assert args.task_id == "t_target"
+    assert args.json is True
+
+
+def test_dispatch_parser_rejects_empty_target_task_id():
+    parser = argparse.ArgumentParser()
+    subcommands = parser.add_subparsers(dest="command")
+    kc.build_parser(subcommands)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["kanban", "dispatch", "--task-id", "   ", "--json"])
+
+
+def test_run_slash_dispatch_task_id_json_includes_target_fields(kanban_home):
+    out = kc.run_slash("dispatch --task-id t_missing --dry-run --json")
+    payload = json.loads(out)
+    assert payload["target_task_id"] == "t_missing"
+    assert payload["target_miss_reason"] == "not_found"
+    assert payload["spawned"] == []
+
+
+def test_run_slash_dispatch_task_id_dry_run_targets_exact_card(
+    kanban_home, monkeypatch
+):
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    first = kc.run_slash("create 'first' --assignee alice --json")
+    target = kc.run_slash("create 'target' --assignee bob --json")
+    first_id = json.loads(first)["id"]
+    target_id = json.loads(target)["id"]
+
+    out = kc.run_slash(f"dispatch --task-id {target_id} --dry-run --json")
+    payload = json.loads(out)
+
+    assert payload["target_task_id"] == target_id
+    assert payload["target_miss_reason"] is None
+    assert [item["task_id"] for item in payload["spawned"]] == [target_id]
+    show_first = kc.run_slash(f"show {first_id}")
+    assert "ready" in show_first.lower()
+
+
 def test_run_slash_context_output_format(kanban_home):
     out = kc.run_slash("create 'tech spec' --assignee alice --body 'write an RFC'")
     import re

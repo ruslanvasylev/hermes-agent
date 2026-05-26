@@ -215,6 +215,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "started_at": task.started_at,
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
+        "idempotency_key": task.idempotency_key,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -257,6 +258,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "started_at": t.started_at,
                     "completed_at": t.completed_at,
                     "result": t.result,
+                    "idempotency_key": t.idempotency_key,
                     "current_run_id": t.current_run_id,
                 }
 
@@ -615,6 +617,7 @@ def _handle_create(args: dict, **kw) -> str:
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
+    initial_status = args.get("initial_status")
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     skills = args.get("skills")
@@ -645,6 +648,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
                 triage=triage,
+                initial_status=str(initial_status) if initial_status is not None else None,
                 idempotency_key=idempotency_key,
                 max_runtime_seconds=(
                     int(max_runtime_seconds)
@@ -1044,6 +1048,15 @@ KANBAN_CREATE_SCHEMA = {
                     "If true, task lands in 'triage' instead of 'todo' "
                     "— a specifier profile is expected to flesh out "
                     "the body before work starts."
+                ),
+            },
+            "initial_status": {
+                "type": "string",
+                "enum": ["blocked", "triage"],
+                "description": (
+                    "Optional initial holding status. Use 'blocked' for "
+                    "non-dispatching projection holds; 'triage' is equivalent "
+                    "to triage=true."
                 ),
             },
             "idempotency_key": {

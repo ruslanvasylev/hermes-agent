@@ -1241,6 +1241,7 @@ def create_task(
     priority: int = 0,
     parents: Iterable[str] = (),
     triage: bool = False,
+    initial_status: Optional[str] = None,
     idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
@@ -1250,9 +1251,11 @@ def create_task(
 
     Returns the new task id.  Status is ``ready`` when there are no
     parents (or all parents already ``done``), otherwise ``todo``.
-    If ``triage=True``, status is forced to ``triage`` regardless of
-    parents — a specifier/triager is expected to promote the task to
-    ``todo`` once the spec is fleshed out.
+    If ``triage=True`` or ``initial_status='triage'``, status is forced to
+    ``triage`` regardless of parents — a specifier/triager is expected to
+    promote the task to ``todo`` once the spec is fleshed out. If
+    ``initial_status='blocked'``, status is forced to ``blocked`` as an
+    explicit non-dispatching hold; recompute/dispatch will not auto-promote it.
 
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
@@ -1279,6 +1282,14 @@ def create_task(
             f"got {workspace_kind!r}"
         )
     parents = tuple(p for p in parents if p)
+    normalized_initial_status = (initial_status or "").strip().lower()
+    if normalized_initial_status:
+        if normalized_initial_status not in {"triage", "blocked"}:
+            raise ValueError("initial_status must be one of: blocked, triage")
+        if triage and normalized_initial_status != "triage":
+            raise ValueError("triage=True conflicts with initial_status")
+    elif triage:
+        normalized_initial_status = "triage"
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -1348,9 +1359,9 @@ def create_task(
         try:
             with write_txn(conn):
                 # Determine initial status from parent status, unless the
-                # caller is parking this task in triage for a specifier.
-                if triage:
-                    initial_status = "triage"
+                # caller explicitly parks this task in a non-default lane.
+                if normalized_initial_status:
+                    initial_status = normalized_initial_status
                 else:
                     initial_status = "ready"
                     if parents:
@@ -1365,9 +1376,9 @@ def create_task(
                         ).fetchall()
                         if any(r["status"] != "done" for r in rows):
                             initial_status = "todo"
-                # Even in triage mode we still need to validate parent ids
-                # so the eventual link rows don't dangle.
-                if triage and parents:
+                # Even in explicit hold mode we still need to validate parent
+                # ids so the eventual link rows don't dangle.
+                if normalized_initial_status and parents:
                     missing = _find_missing_parents(conn, parents)
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")

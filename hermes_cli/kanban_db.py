@@ -98,7 +98,7 @@ _log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
-VALID_INITIAL_STATUSES = {"running", "blocked"}
+VALID_INITIAL_STATUSES = {"running", "blocked", "triage"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
@@ -2069,7 +2069,7 @@ def create_task(
     max_retries: Optional[int] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
-    initial_status: str = "running",
+    initial_status: Optional[str] = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
 ) -> str:
@@ -2077,9 +2077,11 @@ def create_task(
 
     Returns the new task id.  Status is ``ready`` when there are no
     parents (or all parents already ``done``), otherwise ``todo``.
-    If ``triage=True``, status is forced to ``triage`` regardless of
-    parents — a specifier/triager is expected to promote the task to
-    ``todo`` once the spec is fleshed out.
+    If ``triage=True`` or ``initial_status='triage'``, status is forced to
+    ``triage`` regardless of parents — a specifier/triager is expected to
+    promote the task to ``todo`` once the spec is fleshed out. If
+    ``initial_status='blocked'``, status is forced to ``blocked`` as an
+    explicit non-dispatching hold; recompute/dispatch will not auto-promote it.
 
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
@@ -2100,10 +2102,6 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
-    if initial_status not in VALID_INITIAL_STATUSES:
-        raise ValueError(
-            f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
-        )
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -2114,6 +2112,13 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
     parents = tuple(p for p in parents if p)
+    normalized_initial_status = (initial_status or "running").strip().lower()
+    if normalized_initial_status not in VALID_INITIAL_STATUSES:
+        raise ValueError(
+            f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
+        )
+    if triage and normalized_initial_status == "blocked":
+        raise ValueError("triage=True conflicts with initial_status='blocked'")
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -2199,15 +2204,14 @@ def create_task(
         try:
             with write_txn(conn):
                 # Determine task status from parent status, unless the caller
-                # parks it directly in blocked for human-ops review or in
-                # triage for a specifier.
-                if initial_status == "blocked":
+                # explicitly parks this task in a non-default lane.
+                if normalized_initial_status == "blocked":
                     task_status = "blocked"
                     if parents:
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                elif triage:
+                elif triage or normalized_initial_status == "triage":
                     task_status = "triage"
                 else:
                     task_status = "ready"
@@ -2225,7 +2229,7 @@ def create_task(
                             task_status = "todo"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
-                if triage and parents:
+                if (triage or normalized_initial_status == "triage") and parents:
                     missing = _find_missing_parents(conn, parents)
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
@@ -2280,6 +2284,13 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
+                if task_status == "blocked":
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {"reason": "initial_status"},
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:

@@ -324,6 +324,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "started_at": task.started_at,
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
+        "idempotency_key": task.idempotency_key,
         "model_override": task.model_override,
         "parents": parents,
         "children": children,
@@ -368,6 +369,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "started_at": t.started_at,
                     "completed_at": t.completed_at,
                     "result": t.result,
+                    "idempotency_key": t.idempotency_key,
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                 }
@@ -1238,6 +1240,15 @@ KANBAN_CREATE_SCHEMA = {
                     "the body before work starts."
                 ),
             },
+            "initial_status": {
+                "type": "string",
+                "enum": ["running", "blocked", "triage"],
+                "description": (
+                    "Initial card status. 'running' preserves the usual "
+                    "dispatch path, 'blocked' creates a non-dispatching hold, "
+                    "and 'triage' is equivalent to triage=true."
+                ),
+            },
             "idempotency_key": {
                 "type": "string",
                 "description": (
@@ -1252,16 +1263,6 @@ KANBAN_CREATE_SCHEMA = {
                     "Per-task runtime cap. When exceeded, the "
                     "dispatcher SIGTERMs the worker and re-queues the "
                     "task with outcome='timed_out'."
-                ),
-            },
-            "initial_status": {
-                "type": "string",
-                "enum": ["running", "blocked"],
-                "description": (
-                    "Initial card status. Use 'blocked' for tasks that "
-                    "require immediate human ops (R3 gate) to skip the "
-                    "brief running-to-blocked transition. Defaults to "
-                    "'running', which preserves the usual dispatch path."
                 ),
             },
             "skills": {

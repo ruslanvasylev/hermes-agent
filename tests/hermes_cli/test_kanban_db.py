@@ -231,6 +231,30 @@ def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
         assert kb.get_task(conn, c).status == "ready"
 
 
+def test_create_task_initial_blocked_is_durable_hold(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="held projection",
+            assignee="default",
+            initial_status="blocked",
+            idempotency_key="journal-key-1",
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.idempotency_key == "journal-key-1"
+
+        promoted = kb.recompute_ready(conn)
+        dry_run = kb.dispatch_once(conn, dry_run=True, target_task_id=tid)
+
+        assert promoted == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert dry_run.target_task_id == tid
+        assert dry_run.target_miss_reason == "not_ready"
+        assert dry_run.spawned == []
+
+
 def test_create_task_unknown_parent_errors(kanban_home):
     with kb.connect() as conn, pytest.raises(ValueError, match="unknown parent"):
         kb.create_task(conn, title="orphan", parents=["t_ghost"])

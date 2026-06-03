@@ -1,6 +1,8 @@
 """Tests for tools/cronjob_tools.py — prompt scanning, schedule/list/remove dispatchers."""
 
 import json
+from pathlib import Path
+
 import pytest
 
 from tools.cronjob_tools import (

@@ -75,6 +75,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "started_at": t.started_at,
         "completed_at": t.completed_at,
         "result": t.result,
+        "idempotency_key": t.idempotency_key,
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
         "session_id": t.session_id,
@@ -371,9 +372,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
-                          help="Initial card status. Use 'blocked' for cards "
-                               "that require immediate human ops (R3 gate) "
-                               "to skip the brief running-to-blocked transition.")
+                          help="Initial card status: running uses normal dispatch, "
+                               "blocked creates a non-dispatching hold, triage "
+                               "parks for specification.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---

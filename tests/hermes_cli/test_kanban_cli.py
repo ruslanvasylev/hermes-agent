@@ -167,6 +167,27 @@ def test_run_slash_json_output(kanban_home):
     assert payload["status"] == "ready"
 
 
+def test_run_slash_create_initial_blocked_exposes_idempotency_key(kanban_home):
+    out = kc.run_slash(
+        "create 'held projection' --assignee default --initial-status blocked "
+        "--idempotency-key journal-key-1 --json"
+    )
+    payload = json.loads(out)
+    assert payload["status"] == "blocked"
+    assert payload["idempotency_key"] == "journal-key-1"
+
+    listed = json.loads(kc.run_slash("list --json"))
+    assert listed[0]["idempotency_key"] == "journal-key-1"
+
+    shown = json.loads(kc.run_slash(f"show {payload['id']} --json"))
+    assert shown["task"]["idempotency_key"] == "journal-key-1"
+
+    dry_run = json.loads(kc.run_slash(f"dispatch --task-id {payload['id']} --dry-run --json"))
+    assert dry_run["target_task_id"] == payload["id"]
+    assert dry_run["target_miss_reason"] == "not_ready"
+    assert dry_run["spawned"] == []
+
+
 def test_run_slash_dispatch_dry_run_counts(kanban_home):
     kc.run_slash("create 'a' --assignee alice")
     kc.run_slash("create 'b' --assignee bob")

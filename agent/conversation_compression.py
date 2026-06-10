@@ -710,8 +710,10 @@ def compress_context(
                         agent._flush_messages_to_session_db(messages)
                     except Exception:
                         pass  # best-effort — don't block compression on a flush error
-                    # Propagate title to the new session with auto-numbering
+                    # Propagate title and workspace (cwd) to the new session.
                     old_title = agent._session_db.get_session_title(agent.session_id)
+                    old_session_row = agent._session_db.get_session(agent.session_id)
+                    old_cwd = old_session_row.get("cwd") if old_session_row else None
                     agent._session_db.end_session(agent.session_id, "compression")
                     old_session_id = agent.session_id
                     agent.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
@@ -746,6 +748,7 @@ def compress_context(
                             model=agent.model,
                             model_config=agent._session_init_model_config,
                             parent_session_id=old_session_id,
+                            cwd=old_cwd,
                         )
                     except Exception as _cs_err:
                         # The child row could not be created (e.g. FK constraint,

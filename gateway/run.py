@@ -9878,7 +9878,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         context = build_session_context(source, self.config, session_entry)
         
         # Set session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
+        _session_env_tokens = self._set_session_env(
+            context, cwd=session_entry.cwd or ""
+        )
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -10631,6 +10633,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._sync_telegram_topic_binding,
                     source, session_entry, reason="agent-result-compression",
                 )
+
+            # Persist the agent's current working directory so it survives
+            # gateway restarts (#41128).  Read the terminal environment's live
+            # cwd (which reflects cd commands executed during the turn) rather
+            # than the static ContextVar set at turn start.
+            try:
+                from tools.terminal_tool import _active_environments
+
+                _env = _active_environments.get(session_entry.session_id)
+                if _env is None:
+                    _task_id = agent_result.get("task_id", "")
+                    if _task_id:
+                        _env = _active_environments.get(_task_id)
+                if _env is not None:
+                    _live_cwd = getattr(_env, "cwd", "")
+                    if _live_cwd and _live_cwd != session_entry.cwd:
+                        session_entry.cwd = _live_cwd
+                        self.session_store._save()
+            except Exception:
+                pass
 
             # Prepend reasoning/thinking if display is enabled (per-platform).
             # Mattermost requires explicit per-platform opt-in because this is
@@ -13683,7 +13705,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return delivered
 
-    def _set_session_env(self, context: SessionContext) -> list:
+    def _set_session_env(self, context: SessionContext, cwd: str = "") -> list:
         """Set session context variables for the current async task.
 
         Uses ``contextvars`` instead of ``os.environ`` so that concurrent
@@ -13713,6 +13735,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             async_delivery=_async_delivery,
+            cwd=cwd,
         )
 
     def _clear_session_env(self, tokens: list) -> None:

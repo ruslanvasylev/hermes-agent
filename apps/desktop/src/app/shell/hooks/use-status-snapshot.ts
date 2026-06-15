@@ -14,8 +14,14 @@ export function useStatusSnapshot(gatewayState: string | undefined, requestGatew
 
   useEffect(() => {
     let cancelled = false
+    let inFlight = false
 
     const refresh = async () => {
+      if (inFlight) {
+        return
+      }
+
+      inFlight = true
       try {
         const [next, inference] = await Promise.all([
           getStatus(),
@@ -37,6 +43,8 @@ export function useStatusSnapshot(gatewayState: string | undefined, requestGatew
         setInferenceStatus(inference)
       } catch {
         // Keep last snapshot through transient gateway flaps.
+      } finally {
+        inFlight = false
       }
     }
 

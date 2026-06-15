@@ -165,7 +165,7 @@ export function CommandCenterView({ initialSection, onClose, onDeleteSession, on
       const [nextStatus, nextLogs] = await Promise.all([
         getStatus(),
         getLogs({
-          file: 'agent',
+          file: 'gui',
           lines: 120
         })
       ])

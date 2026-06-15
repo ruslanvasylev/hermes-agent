@@ -492,6 +492,30 @@ class TestWebServerEndpoints:
         assert cfg["moa"]["reference_models"] == payload["reference_models"]
         assert cfg["moa"]["aggregator"] == payload["aggregator"]
 
+    def test_get_status_uses_read_only_session_db(self, monkeypatch):
+        import hermes_state
+        from hermes_constants import get_hermes_home
+
+        (get_hermes_home() / "state.db").touch()
+        read_only_flags = []
+
+        class FakeSessionDB:
+            def __init__(self, *args, **kwargs):
+                read_only_flags.append(kwargs.get("read_only"))
+
+            def list_sessions_rich(self, limit=50):
+                return []
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(hermes_state, "SessionDB", FakeSessionDB)
+
+        resp = self.client.get("/api/status")
+
+        assert resp.status_code == 200
+        assert read_only_flags == [True]
+
     # ── GET /api/media (remote image display) ───────────────────────────
 
     def test_get_media_serves_image_in_root(self):

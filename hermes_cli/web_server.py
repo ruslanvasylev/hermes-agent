@@ -2092,12 +2092,12 @@ async def get_status(profile: Optional[str] = None):
         status_scope.__enter__()
 
     try:
-        current_ver, latest_ver = check_config_version()
+        current_ver, latest_ver = await asyncio.to_thread(check_config_version)
         # --- Gateway liveness detection ---
         # Try local PID check first (same-host).  If that fails and a remote
         # GATEWAY_HEALTH_URL is configured, probe the gateway over HTTP so the
         # dashboard works when the gateway runs in a separate container.
-        gateway_pid = get_running_pid()
+        gateway_pid = await asyncio.to_thread(get_running_pid)
         gateway_running = gateway_pid is not None
         remote_health_body: dict | None = None
 
@@ -2116,20 +2116,25 @@ async def get_status(profile: Optional[str] = None):
         gateway_platforms: dict = {}
         gateway_exit_reason = None
         gateway_updated_at = None
-        configured_gateway_platforms: set[str] | None = None
-        try:
+        def _load_configured_gateway_platforms() -> set[str] | None:
             from gateway.config import load_gateway_config
 
             gateway_config = load_gateway_config()
-            configured_gateway_platforms = {
+            return {
                 platform.value for platform in gateway_config.get_connected_platforms()
             }
+
+        configured_gateway_platforms: set[str] | None = None
+        try:
+            configured_gateway_platforms = await asyncio.to_thread(
+                _load_configured_gateway_platforms
+            )
         except Exception:
             configured_gateway_platforms = None
 
         # Prefer the detailed health endpoint response (has full state) when the
         # local runtime status file is absent or stale (cross-container).
-        local_runtime = read_runtime_status()
+        local_runtime = await asyncio.to_thread(read_runtime_status)
         runtime = local_runtime
         if runtime is None and remote_health_body and remote_health_body.get("gateway_state"):
             runtime = remote_health_body
@@ -2139,7 +2144,9 @@ async def get_status(profile: Optional[str] = None):
         # is display-only. (Running os.kill on a remote PID is both wrong and
         # trips the test live-system guard.)
         if not gateway_running and local_runtime is not None:
-            runtime_pid = get_runtime_status_running_pid(local_runtime)
+            runtime_pid = await asyncio.to_thread(
+                get_runtime_status_running_pid, local_runtime
+            )
             if runtime_pid is not None:
                 gateway_running = True
                 gateway_pid = runtime_pid
@@ -2170,20 +2177,28 @@ async def get_status(profile: Optional[str] = None):
         if gateway_running and gateway_state is None and remote_health_body is not None:
             gateway_state = "running"
 
-        active_sessions = 0
-        try:
+        def _count_active_sessions() -> int:
             from hermes_state import SessionDB
-            db = SessionDB()
+
+            db_path = get_hermes_home() / "state.db"
+            db = SessionDB(read_only=True) if db_path.exists() else None
             try:
+                if db is None:
+                    return 0
                 sessions = db.list_sessions_rich(limit=50)
                 now = time.time()
-                active_sessions = sum(
+                return sum(
                     1 for s in sessions
                     if s.get("ended_at") is None
                     and (now - s.get("last_active", s.get("started_at", 0))) < 300
                 )
             finally:
-                db.close()
+                if db is not None:
+                    db.close()
+
+        active_sessions = 0
+        try:
+            active_sessions = await asyncio.to_thread(_count_active_sessions)
         except Exception:
             pass
 
@@ -2227,6 +2242,10 @@ async def get_status(profile: Optional[str] = None):
             # Module not importable yet (early startup) — leave as [].
             pass
 
+        can_update_hermes = not await asyncio.to_thread(
+            _dashboard_local_update_managed_externally
+        )
+
         # Always-public liveness + auth-gate shape. Safe for external uptime
         # probes (NAS's wildcard-subdomain liveness probe), the SPA's pre-login
         # bootstrap, and anyone who can curl the host — i.e. exactly the audience
@@ -2236,7 +2255,7 @@ async def get_status(profile: Optional[str] = None):
             "release_date": __release_date__,
             "config_version": current_ver,
             "latest_config_version": latest_ver,
-            "can_update_hermes": not _dashboard_local_update_managed_externally(),
+            "can_update_hermes": can_update_hermes,
             "gateway_running": gateway_running,
             "gateway_state": gateway_state,
             "gateway_platforms": gateway_platforms,
@@ -8196,7 +8215,7 @@ async def prune_sessions_endpoint(body: SessionPrune):
 
 
 @app.get("/api/logs")
-async def get_logs(
+def get_logs(
     file: str = "agent",
     lines: int = 100,
     level: Optional[str] = None,

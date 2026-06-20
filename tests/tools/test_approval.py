@@ -177,6 +177,16 @@ class TestSessionKeyContext:
         finally:
             approval_module.reset_current_session_key(token)
 
+    def test_empty_session_context_falls_back_to_process_env(self):
+        from gateway.session_context import _VAR_MAP
+
+        token = _VAR_MAP["HERMES_SESSION_KEY"].set("")
+        try:
+            with mock_patch.dict("os.environ", {"HERMES_SESSION_KEY": "bob"}, clear=False):
+                assert approval_module.get_current_session_key() == "bob"
+        finally:
+            _VAR_MAP["HERMES_SESSION_KEY"].reset(token)
+
     def test_gateway_runner_binds_session_key_to_context_before_agent_run(self):
         run_py = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
         module = ast.parse(run_py.read_text(encoding="utf-8"))
@@ -378,6 +388,13 @@ class TestTeePattern:
 
     def test_tee_ssh_authorized_keys(self):
         dangerous, key, desc = detect_dangerous_command("cat file | tee ~/.ssh/authorized_keys")
+        assert dangerous is True
+        assert key is not None
+
+    def test_tee_absolute_ssh_authorized_keys(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "cat file | tee /home/agent/.ssh/authorized_keys"
+        )
         assert dangerous is True
         assert key is not None
 
@@ -591,6 +608,13 @@ class TestSensitiveRedirectPattern:
     def test_append_to_absolute_home_ssh_authorized_keys(self):
         authorized_keys = Path.home() / ".ssh" / "authorized_keys"
         dangerous, key, desc = detect_dangerous_command(f"cat key >> {authorized_keys}")
+        assert dangerous is True
+        assert key is not None
+
+    def test_append_to_generic_absolute_ssh_authorized_keys(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "cat key >> /home/agent/.ssh/authorized_keys"
+        )
         assert dangerous is True
         assert key is not None
 

@@ -161,7 +161,10 @@ def get_current_session_key(default: str = "default") -> str:
     if session_key:
         return session_key
     from gateway.session_context import get_session_env
-    return get_session_env("HERMES_SESSION_KEY", default)
+    session_key = get_session_env("HERMES_SESSION_KEY", "")
+    if session_key:
+        return session_key
+    return os.getenv("HERMES_SESSION_KEY") or default
 
 
 def _get_session_platform() -> str:
@@ -202,7 +205,13 @@ def _is_gateway_approval_context() -> bool:
 # these static patterns stay free of any import-time path snapshot (which would
 # go stale when HERMES_HOME is set after this module is imported, e.g. under the
 # hermetic test conftest or any deferred-profile-resolution path).
-_SSH_SENSITIVE_PATH = r'(?:~|\$home|\$\{home\})/\.ssh(?:/|$)'
+_SSH_SENSITIVE_PATH = (
+    r'(?:'
+    r'(?:~|\$home|\$\{home\})/\.ssh'
+    r'|'
+    r'/(?:[^\s/"\']+/)*\.ssh'
+    r')(?:/|$)'
+)
 _HERMES_ENV_PATH = (
     r'(?:~\/\.hermes/|'
     r'(?:\$home|\$\{home\})/\.hermes/|'

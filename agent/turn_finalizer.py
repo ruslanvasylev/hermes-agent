@@ -189,6 +189,15 @@ def finalize_turn(
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
+    try:
+        messages = agent._strip_internal_message_fields(messages)
+    except Exception as _strip_err:
+        _cleanup_errors.append(f"strip_internal_message_fields: {_strip_err}")
+        logger.error(
+            "finalize_turn: _strip_internal_message_fields failed: %s",
+            _strip_err,
+            exc_info=True,
+        )
 
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.

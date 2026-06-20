@@ -2139,7 +2139,7 @@ class TestRunJobSkillBacked:
             register_env_passthrough(["NOTION_API_KEY"])
             return json.dumps({"success": True, "content": "# notion\nUse Notion."})
 
-        def _run_conversation(prompt):
+        def _run_conversation(prompt, **kwargs):
             from tools.env_passthrough import get_all_passthrough
 
             assert "NOTION_API_KEY" in get_all_passthrough()
@@ -2196,7 +2196,7 @@ class TestRunJobSkillBacked:
             register_credential_file("credentials/google_token.json")
             return json.dumps({"success": True, "content": "# google-workspace\nUse Google."})
 
-        def _run_conversation(prompt):
+        def _run_conversation(prompt, **kwargs):
             from tools.credential_files import _get_registered
 
             registered = _get_registered()
@@ -2275,6 +2275,62 @@ class TestRunJobSkillBacked:
         assert "blogwatcher" in prompt_arg
         assert "Follow this skill" in prompt_arg
         assert "Check the feeds and summarize anything new." in prompt_arg
+
+    def test_run_job_persists_clean_receipt_while_sending_full_skill_prompt(self, tmp_path):
+        job = {
+            "id": "skill-history-job",
+            "name": "skill history test",
+            "prompt": "Check the feeds and summarize anything new.",
+            "schedule": "0 9 * * *",
+            "skill": "blogwatcher",
+        }
+
+        fake_db = MagicMock()
+        skill_body = "# Blogwatcher\nFull skill content.\nUse the hidden feed list."
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("tools.skills_tool.skill_view", return_value=json.dumps({"success": True, "content": skill_body})), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+
+        prompt_arg = mock_agent.run_conversation.call_args.args[0]
+        persist_arg = mock_agent.run_conversation.call_args.kwargs["persist_user_message"]
+
+        assert "[IMPORTANT:" in prompt_arg
+        assert "blogwatcher" in prompt_arg
+        assert "Full skill content." in prompt_arg
+        assert "Use the hidden feed list." in prompt_arg
+        assert "Check the feeds and summarize anything new." in prompt_arg
+
+        assert "Cron job: skill history test" in persist_arg
+        assert "Job ID: skill-history-job" in persist_arg
+        assert "Schedule: 0 9 * * *" in persist_arg
+        assert "Skills: blogwatcher" in persist_arg
+        assert "Instruction:" in persist_arg
+        assert "Check the feeds and summarize anything new." in persist_arg
+        assert "[IMPORTANT:" not in persist_arg
+        assert "Full skill content." not in persist_arg
+        assert "Use the hidden feed list." not in persist_arg
 
     def test_run_job_loads_multiple_skills_in_order(self, tmp_path):
         job = {

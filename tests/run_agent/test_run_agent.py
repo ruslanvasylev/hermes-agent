@@ -103,6 +103,33 @@ def test_persist_user_message_override_preserves_multimodal_turns(agent):
     assert messages == [{"role": "user", "content": multimodal_content}]
 
 
+def test_persist_user_message_keeps_api_prompt_but_returns_clean_history(agent):
+    seen = {}
+    agent._cleanup_dead_connections = lambda: False
+    agent._save_session_log = MagicMock()
+    agent._flush_messages_to_session_db = MagicMock()
+    agent._cleanup_task_resources = MagicMock()
+    agent._save_trajectory = MagicMock()
+
+    def fake_api_call(api_kwargs):
+        seen["content"] = api_kwargs["messages"][-1]["content"]
+        return _mock_response(content="ok", finish_reason="stop")
+
+    agent._interruptible_api_call = fake_api_call
+
+    result = agent.run_conversation(
+        "API-only synthetic prompt",
+        persist_user_message="Clean transcript message",
+    )
+
+    assert seen["content"] == "API-only synthetic prompt"
+    assert result["messages"][0]["content"] == "Clean transcript message"
+    assert "_api_content_override" not in result["messages"][0]
+    saved_messages = agent._save_session_log.call_args.args[0]
+    assert saved_messages[0]["content"] == "Clean transcript message"
+    assert "_api_content_override" not in saved_messages[0]
+
+
 @pytest.fixture()
 def agent_with_memory_tool():
     """Agent whose valid_tool_names includes 'memory'."""

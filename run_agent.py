@@ -1583,16 +1583,53 @@ class AIAgent:
                 if timestamp is not None:
                     msg["timestamp"] = timestamp
 
+    def _stash_api_user_message_override(self, messages: List[Dict]) -> None:
+        """Remember the API-facing text before persistence rewrites it.
+
+        ``persist_user_message`` is intentionally a transcript/storage override:
+        the model should still see the original user message for this turn.
+        Early crash-resilience persistence runs before the first API call, so a
+        text rewrite must keep the original content available for request
+        assembly without leaking that private field into persisted history.
+        """
+        idx = getattr(self, "_persist_user_message_idx", None)
+        override = getattr(self, "_persist_user_message_override", None)
+        if idx is None or override is None:
+            return
+        if 0 <= idx < len(messages):
+            msg = messages[idx]
+            if (
+                isinstance(msg, dict)
+                and msg.get("role") == "user"
+                and not isinstance(msg.get("content"), list)
+                and "_api_content_override" not in msg
+            ):
+                msg["_api_content_override"] = msg.get("content")
+
+    def _strip_internal_message_fields(self, messages: List[Dict]) -> List[Dict]:
+        """Return a persistence/result-safe copy of messages."""
+        cleaned: List[Dict] = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                clean = dict(msg)
+                clean.pop("_api_content_override", None)
+                cleaned.append(clean)
+            else:
+                cleaned.append(msg)
+        return cleaned
+
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save session state to both JSON log and SQLite on any exit path.
 
         Ensures conversations are never lost, even on errors or early returns.
         """
         self._drop_trailing_empty_response_scaffolding(messages)
+        self._stash_api_user_message_override(messages)
         self._apply_persist_user_message_override(messages)
-        self._session_messages = messages
-        self._save_session_log(messages)
-        self._flush_messages_to_session_db(messages, conversation_history)
+        persisted_messages = self._strip_internal_message_fields(messages)
+        self._session_messages = persisted_messages
+        self._save_session_log(persisted_messages)
+        self._flush_messages_to_session_db(persisted_messages, conversation_history)
 
     def _checkpoint_session_progress(
         self,

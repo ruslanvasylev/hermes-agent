@@ -762,6 +762,9 @@ def run_conversation(
         api_messages = []
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
+            api_content_override = api_msg.pop("_api_content_override", None)
+            if api_content_override is not None:
+                api_msg["content"] = api_content_override
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks

@@ -137,6 +137,14 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+_orphaned_notifications: list[dict] = []
+_MAX_ORPHANED_NOTIFICATIONS = 256
+_OWNER_REQUIRED_NOTIFICATION_TYPES = frozenset({
+    "async_delegation",
+    "completion",
+    "watch_disabled",
+    "watch_match",
+})
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -6272,34 +6280,132 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"status": "streaming"})
 
 
-def _notification_event_belongs_elsewhere(session: dict, evt: dict) -> bool:
-    """True if ``evt`` is owned by a *different* live session.
+def _notification_event_route(session: dict, evt: dict) -> str:
+    """Classify whether ``session`` may consume a queued runtime event.
 
-    Background-process events carry the ``session_key`` of the session that
-    started the process. Since all desktop sessions share one process-wide
-    completion queue, each poller must skip events it doesn't own so a
-    background job's completion surfaces in the session that launched it — not
-    whichever poller happened to dequeue first. Orphaned events (owner gone)
-    and global/system events (empty ``session_key``) return False so the
-    current poller still handles them rather than losing them.
+    Returns ``"handle"`` for events owned by this session (or truly global
+    events with no owner), ``"defer"`` for events owned by another live
+    session, ``"unowned"`` for runtime events that are missing an owner key,
+    and ``"orphan"`` for events stamped with a non-empty owner that has no live
+    session.  Non-handle routes fail closed: they are never injected into
+    whichever unrelated desktop tab drains the shared process-wide queue first.
     """
     evt_key = str(evt.get("session_key") or "")
+    evt_type = str(evt.get("type") or "completion")
     if not evt_key:
-        return False
+        if evt_type in _OWNER_REQUIRED_NOTIFICATION_TYPES or evt_type.startswith("watch_overflow_"):
+            return "unowned"
+        return "handle"
     if evt_key == str(session.get("session_key") or ""):
-        return False
+        return "handle"
     try:
         with _sessions_lock:
             snapshot = list(_sessions.values())
     except Exception:
-        # If we can't safely enumerate live sessions, fail open so we don't
-        # crash the poller thread or drop the event.
-        return False
+        # If we can't safely enumerate live sessions, do not deliver the event
+        # to the wrong session.  Park it rather than fail-open into user intent.
+        return "orphan"
 
-    return any(
+    if any(
         s is not session and str(s.get("session_key") or "") == evt_key
         for s in snapshot
+    ):
+        return "defer"
+    return "orphan"
+
+
+def _notification_event_belongs_elsewhere(session: dict, evt: dict) -> bool:
+    """Compatibility wrapper used by older tests/callers."""
+    return _notification_event_route(session, evt) != "handle"
+
+
+def _park_orphaned_notification(evt: dict, *, reason: str = "orphaned") -> None:
+    """Keep bounded diagnostics for a completion event with no live owner."""
+    record = {
+        "parked_at": time.time(),
+        "reason": reason,
+        "session_key": str(evt.get("session_key") or ""),
+        "type": evt.get("type", "completion"),
+        "event": dict(evt),
+    }
+    _orphaned_notifications.append(record)
+    del _orphaned_notifications[:-_MAX_ORPHANED_NOTIFICATIONS]
+
+
+def _notification_persist_user_message(evt: dict) -> str:
+    """Short durable transcript marker for runtime-triggered turns.
+
+    The live model prompt still receives the formatted notification, but the DB
+    transcript should not preserve large foreign result blobs as if a human
+    typed them.  Store a compact, typed provenance marker instead.
+    """
+    evt_type = evt.get("type", "completion")
+    if evt_type == "async_delegation":
+        delegation_id = evt.get("delegation_id") or "unknown"
+        return (
+            "Runtime notification for this session: async delegation "
+            f"{delegation_id} completed."
+        )
+    session_id = evt.get("session_id") or "unknown"
+    if evt_type == "watch_match":
+        return (
+            "Runtime notification for this session: background process "
+            f"{session_id} matched watch pattern."
+        )
+    return (
+        "Runtime notification for this session: background process "
+        f"{session_id} completed."
     )
+
+
+def _submit_notification_prompt(rid: str, sid: str, session: dict, evt: dict, text: str) -> None:
+    """Submit a same-session runtime notification with transcript hygiene."""
+    try:
+        params = inspect.signature(_run_prompt_submit).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "persist_user_message" in params:
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            text,
+            persist_user_message=_notification_persist_user_message(evt),
+        )
+    else:
+        _run_prompt_submit(rid, sid, session, text)
+
+
+def _drain_owned_notification_events(session: dict) -> list[tuple[dict, str]]:
+    """Drain only notifications that this session is allowed to consume."""
+    from tools.process_registry import process_registry, format_process_notification
+
+    results: list[tuple[dict, str]] = []
+    deferred: list[dict] = []
+    while not process_registry.completion_queue.empty():
+        try:
+            evt = process_registry.completion_queue.get_nowait()
+        except Exception:
+            break
+        route = _notification_event_route(session, evt)
+        if route in {"defer", "unowned"}:
+            deferred.append(evt)
+            continue
+        if route == "orphan":
+            _park_orphaned_notification(evt)
+            continue
+        if process_registry.is_notification_delivered(evt):
+            continue
+        _evt_sid = evt.get("session_id", "")
+        if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
+            continue
+        text = format_process_notification(evt)
+        if text:
+            results.append((evt, text))
+
+    for evt in deferred:
+        process_registry.completion_queue.put(evt)
+    return results
 
 
 def _notification_event_dedup_key(evt: dict) -> tuple:
@@ -6348,10 +6454,9 @@ def _notification_poller_loop(
     status.update (kind=process) for user visibility, then chains an
     agent turn via _run_prompt_submit if the session is idle.
 
-    NOTE: The completion_queue is global (one per process). If multiple
-    TUI sessions coexist, whichever poller wakes first grabs the event,
-    even if the process was started by a different session. This matches
-    CLI/gateway behavior (single session per process).
+    NOTE: The completion_queue is global (one per process). Multiple TUI
+    sessions can coexist, so every consumer must route by session_key before
+    submitting a notification as an agent turn.
     """
     from tools.process_registry import process_registry, format_process_notification
 
@@ -6365,11 +6470,19 @@ def _notification_poller_loop(
         # Multiple desktop sessions share this one process-wide queue. Only
         # consume events that belong to *this* session — otherwise a background
         # process started in session A would surface its completion in whichever
-        # session's poller happened to wake first (Ben's "reported in a
-        # different session" bug). Leave foreign events for their owner.
-        if _notification_event_belongs_elsewhere(session, evt):
+        # session's poller happened to wake first. Foreign live-session and
+        # unowned runtime events are requeued for a matching owner/explicit CLI
+        # drain; stale owner keys are parked instead of being injected into the
+        # current session.
+        route = _notification_event_route(session, evt)
+        if route in {"defer", "unowned"}:
             process_registry.completion_queue.put(evt)
             time.sleep(0.1)
+            continue
+        if route == "orphan":
+            _park_orphaned_notification(evt)
+            continue
+        if process_registry.is_notification_delivered(evt):
             continue
 
         _evt_sid = evt.get("session_id", "")
@@ -6398,7 +6511,8 @@ def _notification_poller_loop(
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text)
+            process_registry.mark_notification_delivered(evt)
+            _submit_notification_prompt(rid, sid, session, evt, text)
         except Exception as exc:
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
@@ -6417,8 +6531,14 @@ def _notification_poller_loop(
             evt = process_registry.completion_queue.get_nowait()
         except Exception:
             break
-        if _notification_event_belongs_elsewhere(session, evt):
+        route = _notification_event_route(session, evt)
+        if route in {"defer", "unowned"}:
             deferred.append(evt)
+            continue
+        if route == "orphan":
+            _park_orphaned_notification(evt)
+            continue
+        if process_registry.is_notification_delivered(evt):
             continue
         _evt_sid = evt.get("session_id", "")
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
@@ -6441,7 +6561,8 @@ def _notification_poller_loop(
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text)
+            process_registry.mark_notification_delivered(evt)
+            _submit_notification_prompt(rid, sid, session, evt, text)
         except Exception as exc:
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
@@ -6468,7 +6589,14 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
-def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+def _run_prompt_submit(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    *,
+    persist_user_message: Optional[str] = None,
+) -> None:
     with session["history_lock"]:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
@@ -6605,13 +6733,16 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     payload["rendered"] = r
                 _emit("message.delta", sid, payload)
 
-            run_kwargs = {
+            run_kwargs: dict[str, Any] = {
                 "conversation_history": list(history),
                 "stream_callback": _stream,
             }
             try:
-                if "task_id" in inspect.signature(agent.run_conversation).parameters:
+                run_params = inspect.signature(agent.run_conversation).parameters
+                if "task_id" in run_params:
                     run_kwargs["task_id"] = session["session_key"]
+                if persist_user_message is not None and "persist_user_message" in run_params:
+                    run_kwargs["persist_user_message"] = persist_user_message
             except (TypeError, ValueError):
                 pass
             result = agent.run_conversation(run_message, **run_kwargs)
@@ -6870,7 +7001,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         try:
             from tools.process_registry import process_registry
 
-            for _evt, synth in process_registry.drain_notifications():
+            for _evt, synth in _drain_owned_notification_events(session):
                 with session["history_lock"]:
                     if session.get("running"):
                         process_registry.completion_queue.put(_evt)
@@ -6878,7 +7009,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     session["running"] = True
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    process_registry.mark_notification_delivered(_evt)
+                    _submit_notification_prompt(rid, sid, session, _evt, synth)
                 except Exception as _n_exc:
                     print(
                         f"[tui_gateway] completion notification dispatch failed: "

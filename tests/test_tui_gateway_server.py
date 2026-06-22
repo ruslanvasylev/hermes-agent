@@ -1955,13 +1955,75 @@ def test_notification_event_routing_by_session_key(monkeypatch):
 
     # My own event → handle it.
     assert server._notification_event_belongs_elsewhere(mine, {"session_key": "mine"}) is False
-    # Global/system event with no owner → handle it.
-    assert server._notification_event_belongs_elsewhere(mine, {"session_key": ""}) is False
-    assert server._notification_event_belongs_elsewhere(mine, {}) is False
+    # Runtime completion events require an owner; missing owner parks/fails closed.
+    assert server._notification_event_belongs_elsewhere(mine, {"session_key": ""}) is True
+    assert server._notification_event_route(mine, {"session_key": ""}) == "unowned"
+    assert server._notification_event_belongs_elsewhere(mine, {}) is True
+    assert server._notification_event_route(mine, {}) == "unowned"
+    # Unknown non-runtime global events may still be handled by any session.
+    assert server._notification_event_route(mine, {"type": "system_notice"}) == "handle"
     # Owned by another *live* session → defer to that session's poller.
     assert server._notification_event_belongs_elsewhere(mine, {"session_key": "other"}) is True
-    # Owner is gone (not in _sessions) → handle as fallback so it isn't lost.
-    assert server._notification_event_belongs_elsewhere(mine, {"session_key": "ghost"}) is False
+    assert server._notification_event_route(mine, {"session_key": "other"}) == "defer"
+    # Owner is gone (not in _sessions) → park/fail closed; never inject into mine.
+    assert server._notification_event_belongs_elsewhere(mine, {"session_key": "ghost"}) is True
+    assert server._notification_event_route(mine, {"session_key": "ghost"}) == "orphan"
+
+
+def test_drain_owned_notifications_defers_foreign_and_parks_orphans(monkeypatch):
+    """The post-turn safety-net drain must not steal another session's events."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    mine = _session(session_key="mine")
+    other = _session(session_key="other")
+    monkeypatch.setattr(server, "_sessions", {"mine_sid": mine, "other_sid": other})
+
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_orphaned_notifications", [])
+
+    own = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_mine",
+        "session_key": "mine",
+        "goal": "owned work",
+        "summary": "owned result",
+    }
+    foreign = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_other",
+        "session_key": "other",
+        "goal": "other work",
+        "summary": "other result",
+    }
+    orphan = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_ghost",
+        "session_key": "ghost",
+        "goal": "ghost work",
+        "summary": "ghost result",
+    }
+    missing_owner = {
+        "type": "completion",
+        "session_id": "proc_missing_owner",
+        "session_key": "",
+        "command": "echo ok",
+        "exit_code": 0,
+        "output": "ok",
+    }
+
+    for evt in (foreign, own, orphan, missing_owner):
+        isolated_queue.put(evt)
+
+    drained = server._drain_owned_notification_events(mine)
+    drained_ids = [evt.get("delegation_id") or evt.get("session_id") for evt, _ in drained]
+    assert drained_ids == ["deleg_mine"]
+
+    requeued = [isolated_queue.get_nowait(), isolated_queue.get_nowait()]
+    assert requeued == [foreign, missing_owner]
+    assert server._orphaned_notifications[-1]["event"]["delegation_id"] == "deleg_ghost"
 
 
 def test_session_create_does_not_persist_empty_row(monkeypatch):
@@ -7033,9 +7095,18 @@ def test_notification_poller_delivers_completion(monkeypatch):
     turns = []
     emitted = []
 
+    persisted = []
+
     class _Agent:
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            persist_user_message=None,
+        ):
             turns.append(prompt)
+            persisted.append(persist_user_message)
             return {
                 "final_response": "ok",
                 "messages": [{"role": "assistant", "content": "ok"}],
@@ -7073,6 +7144,7 @@ def test_notification_poller_delivers_completion(monkeypatch):
     isolated_queue.put({
         "type": "completion",
         "session_id": "proc_poller_test",
+        "session_key": "session-key",
         "command": "echo hello",
         "exit_code": 0,
         "output": "hello",
@@ -7090,6 +7162,9 @@ def test_notification_poller_delivers_completion(monkeypatch):
         # Should have triggered an agent turn
         assert len(turns) == 1
         assert "[IMPORTANT: Background process proc_poller_test completed normally" in turns[0]
+        assert persisted == [
+            "Runtime notification for this session: background process proc_poller_test completed."
+        ]
     finally:
         server._sessions.pop("sid_poll", None)
         while not process_registry.completion_queue.empty():
@@ -7133,6 +7208,7 @@ def test_notification_poller_skips_consumed(monkeypatch):
     isolated_queue.put({
         "type": "completion",
         "session_id": "proc_already_done",
+        "session_key": "session-key",
         "command": "echo x",
         "exit_code": 0,
         "output": "x",
@@ -7175,6 +7251,7 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
     evt = {
         "type": "completion",
         "session_id": "proc_busy_test",
+        "session_key": "session-key",
         "command": "make build",
         "exit_code": 0,
         "output": "ok",
@@ -7199,6 +7276,46 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
         server._sessions.pop("sid_busy", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_parks_orphaned_owner_key(monkeypatch):
+    """A stale owner key must not fall back into the current active session."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    turns = []
+    emitted = []
+
+    def _fake_run_prompt_submit(rid, sid, session, text):
+        turns.append(text)
+        with session["history_lock"]:
+            session["running"] = False
+
+    sess = _session(session_key="mine")
+    monkeypatch.setattr(server, "_sessions", {"sid_orphan": sess})
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: emitted.append(a))
+    monkeypatch.setattr(server, "_run_prompt_submit", _fake_run_prompt_submit)
+    monkeypatch.setattr(server, "_orphaned_notifications", [])
+
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    isolated_queue.put({
+        "type": "async_delegation",
+        "delegation_id": "deleg_orphan",
+        "session_key": "ghost",
+        "goal": "avatar work that does not belong here",
+        "summary": "unrelated result",
+    })
+
+    stop = threading.Event()
+    stop.set()
+
+    server._notification_poller_loop(stop, "sid_orphan", sess)
+    assert turns == []
+    assert [a for a in emitted if a[0] == "status.update"] == []
+    assert process_registry.completion_queue.empty()
+    assert server._orphaned_notifications[-1]["event"]["delegation_id"] == "deleg_orphan"
 
 
 def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, tmp_path):
@@ -7306,6 +7423,7 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     base = {
         "type": "watch_match",
         "session_id": "proc_watch_dedup",
+        "session_key": "session-key",
         "command": "tail -f app.log",
         "pattern": "READY",
         "output": "READY on port 8000",
@@ -7325,7 +7443,7 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
         status_text = "\n".join(call[2]["text"] for call in status_calls)
         assert "READY on port 8000" in status_text
         assert "READY on port 9000" in status_text
-        assert len(turns) == 3
+        assert len(turns) == 2
     finally:
         server._sessions.pop("sid_watch_dedup", None)
         while not process_registry.completion_queue.empty():

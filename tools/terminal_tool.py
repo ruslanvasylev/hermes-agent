@@ -2148,10 +2148,10 @@ def terminal_tool(
             # Spawn a tracked background process via the process registry.
             # For local backends: uses subprocess.Popen with output buffering.
             # For non-local backends: runs inside the sandbox via env.execute().
-            from tools.approval import get_current_session_key
+            from tools.approval import get_current_delivery_session_key
             from tools.process_registry import process_registry
 
-            session_key = get_current_session_key(default="")
+            session_key = get_current_delivery_session_key(default="")
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
                 env=env,

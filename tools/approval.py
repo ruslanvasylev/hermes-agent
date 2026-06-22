@@ -122,6 +122,42 @@ def get_current_session_key(default: str = "default") -> str:
     return get_session_env("HERMES_SESSION_KEY", default)
 
 
+_DB_SESSION_ID_RE = re.compile(r"^\d{8}_\d{6}_[0-9a-fA-F]{6}$")
+
+
+def _looks_like_db_session_id(value: str) -> bool:
+    return bool(value and _DB_SESSION_ID_RE.match(str(value)))
+
+
+def get_current_delivery_session_key(default: str = "") -> str:
+    """Return the session key to stamp on asynchronous completion events.
+
+    Gateway/platform sessions use stable route keys such as
+    ``agent:main:telegram:dm:<chat>``; those must survive compression because
+    they are the only way to route a later completion back to the platform.
+
+    TUI/CLI sessions, however, use Hermes DB session ids as their delivery key.
+    During in-turn compression, ``HERMES_SESSION_ID`` is advanced immediately,
+    but the approval/session-key context can still hold the old DB id until the
+    gateway turn unwinds. Background-process and async-delegation completions
+    stamped with that old id become orphaned and may later be drained by an
+    unrelated session. When both values are DB ids, prefer the live rotated
+    ``HERMES_SESSION_ID`` for delivery.
+    """
+    session_key = get_current_session_key(default=default)
+    try:
+        from gateway.session_context import get_session_env
+
+        session_id = get_session_env("HERMES_SESSION_ID", "")
+    except Exception:
+        session_id = os.getenv("HERMES_SESSION_ID", "") or ""
+    if _looks_like_db_session_id(session_id) and (
+        not session_key or _looks_like_db_session_id(session_key)
+    ):
+        return session_id
+    return session_key
+
+
 def _get_session_platform() -> str:
     """Return the current gateway platform from contextvars/env fallback."""
     try:

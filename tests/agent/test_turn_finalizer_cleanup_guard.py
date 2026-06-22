@@ -74,6 +74,9 @@ class _StubAgent:
         if "persist_session" in self._raise_in:
             raise RuntimeError("sqlite database is locked")
 
+    def _strip_internal_message_fields(self, messages):
+        return messages
+
     # --- harmless no-ops ------------------------------------------------
     def _emit_status(self, *a, **k):
         pass

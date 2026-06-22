@@ -1629,7 +1629,9 @@ class AIAgent:
         persisted_messages = self._strip_internal_message_fields(messages)
         self._session_messages = persisted_messages
         self._save_session_log(persisted_messages)
-        self._flush_messages_to_session_db(persisted_messages, conversation_history)
+        # Preserve original dict identities for SQLite dedupe across repeated
+        # persist calls. JSON/session logs still receive stripped copies.
+        self._flush_messages_to_session_db(messages, conversation_history)
 
     def _checkpoint_session_progress(
         self,

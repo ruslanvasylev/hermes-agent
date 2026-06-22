@@ -187,6 +187,41 @@ class TestSessionKeyContext:
         finally:
             _VAR_MAP["HERMES_SESSION_KEY"].reset(token)
 
+    def test_delivery_session_key_prefers_rotated_db_session_id(self):
+        """Async/background completions must follow in-turn compression rotation."""
+        from gateway.session_context import _VAR_MAP
+
+        old = "20260622_093706_dad699"
+        new = "20260622_100512_b0c900"
+        session_tokens = (
+            _VAR_MAP["HERMES_SESSION_KEY"].set(old),
+            _VAR_MAP["HERMES_SESSION_ID"].set(new),
+        )
+        token = approval_module.set_current_session_key(old)
+        try:
+            assert approval_module.get_current_delivery_session_key(default="") == new
+        finally:
+            approval_module.reset_current_session_key(token)
+            _VAR_MAP["HERMES_SESSION_KEY"].reset(session_tokens[0])
+            _VAR_MAP["HERMES_SESSION_ID"].reset(session_tokens[1])
+
+    def test_delivery_session_key_preserves_gateway_route_keys(self):
+        """Platform route keys must not be replaced by DB ids after compression."""
+        from gateway.session_context import _VAR_MAP
+
+        route = "agent:main:telegram:dm:12345"
+        session_tokens = (
+            _VAR_MAP["HERMES_SESSION_KEY"].set(route),
+            _VAR_MAP["HERMES_SESSION_ID"].set("20260622_100512_b0c900"),
+        )
+        token = approval_module.set_current_session_key(route)
+        try:
+            assert approval_module.get_current_delivery_session_key(default="") == route
+        finally:
+            approval_module.reset_current_session_key(token)
+            _VAR_MAP["HERMES_SESSION_KEY"].reset(session_tokens[0])
+            _VAR_MAP["HERMES_SESSION_ID"].reset(session_tokens[1])
+
     def test_gateway_runner_binds_session_key_to_context_before_agent_run(self):
         run_py = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
         module = ast.parse(run_py.read_text(encoding="utf-8"))

@@ -2776,7 +2776,7 @@ def delegate_task(
     # keep chatting, get the combined summaries back together at the end.
     if background:
         from tools.async_delegation import dispatch_async_delegation_batch
-        from tools.approval import get_current_session_key
+        from tools.approval import get_current_delivery_session_key
 
         # Stateless request/response sessions (the API server / WebUI path)
         # cannot route a detached subagent result back to the agent after the
@@ -2806,7 +2806,7 @@ def delegate_task(
                 )
             return json.dumps(_sync_result, ensure_ascii=False)
 
-        _session_key = get_current_session_key(default="")
+        _session_key = get_current_delivery_session_key(default="")
         _child_agents = [c for (_, _, c) in children]
 
         # Detach every child from the parent's interrupt-propagation list — the

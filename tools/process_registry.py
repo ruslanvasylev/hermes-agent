@@ -59,6 +59,7 @@ MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
 FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
 MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
+MAX_NOTIFICATION_DELIVERY_KEYS = 4096  # Bound cross-consumer notification dedupe memory
 
 # Watch pattern rate limiting — PER SESSION.
 # Hard rule: at most ONE watch-match notification every WATCH_MIN_INTERVAL_SECONDS.
@@ -188,6 +189,13 @@ class ProcessRegistry:
         # consults this set; the gateway/tui watchers deliberately do NOT.
         self._poll_observed: set = set()
 
+        # Notification delivery dedupe across *all* completion_queue consumers
+        # (CLI idle drain, TUI poller, TUI post-turn drain, gateway drains).
+        # Local per-poller UI dedupe is not enough: a requeued event can move
+        # between consumers and be submitted as multiple synthetic user turns.
+        self._notification_delivered: set = set()
+        self._notification_delivered_order: list[tuple] = []
+
         # Global watch-match circuit breaker — across all sessions.
         # Prevents sibling processes from collectively flooding the user even
         # when each stays under its own per-session cap.
@@ -205,6 +213,53 @@ class ProcessRegistry:
         # terminal tab. Distinct from kill — the process keeps running; only the
         # UI view is dropped (the user can reopen it from the status stack).
         self.on_close = None
+
+    @staticmethod
+    def notification_delivery_key(evt: dict) -> tuple:
+        """Stable identity for one queued notification delivery.
+
+        Completion events are one-shot per process.  Async delegations are
+        one-shot per delegation id.  Watch matches are event-specific so a live
+        server can notify on distinct matches while exact replays are deduped.
+        """
+        evt_type = evt.get("type", "completion")
+        evt_sid = evt.get("session_id", "")
+        if evt_type == "async_delegation":
+            return (evt_type, evt.get("delegation_id", ""))
+        if evt_type == "watch_match":
+            return (
+                evt_type,
+                evt_sid,
+                evt.get("command", ""),
+                evt.get("pattern", ""),
+                evt.get("output", ""),
+                evt.get("suppressed", 0),
+                evt.get("message_id", ""),
+            )
+        if evt_type.startswith("watch_overflow_") or evt_type == "watch_disabled":
+            return (
+                evt_type,
+                evt_sid,
+                evt.get("command", ""),
+                evt.get("message", ""),
+                evt.get("suppressed", 0),
+            )
+        return (evt_type, evt_sid)
+
+    def is_notification_delivered(self, evt: dict) -> bool:
+        with self._lock:
+            return self.notification_delivery_key(evt) in self._notification_delivered
+
+    def mark_notification_delivered(self, evt: dict) -> None:
+        with self._lock:
+            key = self.notification_delivery_key(evt)
+            if key in self._notification_delivered:
+                return
+            self._notification_delivered.add(key)
+            self._notification_delivered_order.append(key)
+            while len(self._notification_delivered_order) > MAX_NOTIFICATION_DELIVERY_KEYS:
+                old = self._notification_delivered_order.pop(0)
+                self._notification_delivered.discard(old)
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -1162,10 +1217,13 @@ class ProcessRegistry:
             except Exception:
                 break
             _evt_sid = evt.get("session_id", "")
+            if self.is_notification_delivered(evt):
+                continue
             if evt.get("type") == "completion" and self._drain_should_skip(_evt_sid):
                 continue
             text = format_process_notification(evt)
             if text:
+                self.mark_notification_delivered(evt)
                 results.append((evt, text))
         return results
 

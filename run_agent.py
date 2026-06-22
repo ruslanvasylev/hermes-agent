@@ -1164,7 +1164,9 @@ class AIAgent:
           1. ``providers.<id>.models.<model>.stale_timeout_seconds``
           2. ``providers.<id>.stale_timeout_seconds``
           3. ``HERMES_API_CALL_STALE_TIMEOUT`` env var
-          4. 90.0s default (time-to-first-byte for non-streaming / Codex
+          4. reasoning-model floor over the provider/default fallback
+          5. provider profile default for known long-running providers
+          6. 90.0s default (time-to-first-byte for non-streaming / Codex
              internal-streaming requests; lowered from 300s in May 2026 so
              fallback providers kick in faster when upstream providers
              stall).  The detector still scales up for large contexts in
@@ -1183,6 +1185,13 @@ class AIAgent:
         if env_timeout is not None:
             return float(env_timeout), False
 
+        try:
+            from providers import get_provider_profile
+            profile = get_provider_profile(getattr(self, "provider", ""))
+        except Exception:
+            profile = None
+        profile_timeout = getattr(profile, "default_stale_timeout_seconds", None)
+
         # Reasoning-model floor: auto-mitigation for known reasoning models
         # (Nemotron 3 Ultra, OpenAI o1/o3, Anthropic Opus 4.x thinking,
         # DeepSeek R1, Qwen QwQ, xAI Grok reasoning, etc.) whose cloud
@@ -1194,7 +1203,11 @@ class AIAgent:
         from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
         reasoning_floor = get_reasoning_stale_timeout_floor(self.model)
         if reasoning_floor is not None:
-            return reasoning_floor, False
+            provider_floor = float(profile_timeout or 90.0)
+            return max(provider_floor, reasoning_floor), False
+
+        if profile_timeout is not None:
+            return float(profile_timeout), True
 
         return 90.0, True
 

@@ -7585,18 +7585,13 @@ def _(rid, params: dict) -> dict:
 def _notification_event_route(session: dict, evt: dict) -> str:
     """Classify whether ``session`` may consume a queued runtime event.
 
-    Returns ``"handle"`` for events owned by this session (or truly global
-    events with no owner), ``"defer"`` for events owned by another live
-    session, ``"unowned"`` for runtime events that are missing an owner key,
-    and ``"orphan"`` for events stamped with a non-empty owner that has no live
-    session.  Non-handle routes fail closed: they are never injected into
-    whichever unrelated desktop tab drains the shared process-wide queue first.
+    Returns ``"handle"`` for events owned by this session, global events with
+    no owner, and events whose owner is no longer live. Returns ``"defer"``
+    for events owned by another live session so that owner's poller can handle
+    them.
     """
     evt_key = str(evt.get("session_key") or "")
-    evt_type = str(evt.get("type") or "completion")
     if not evt_key:
-        if evt_type in _OWNER_REQUIRED_NOTIFICATION_TYPES or evt_type.startswith("watch_overflow_"):
-            return "unowned"
         return "handle"
     if evt_key in _session_live_keys(session):
         with _sessions_lock:
@@ -7607,64 +7602,16 @@ def _notification_event_route(session: dict, evt: dict) -> str:
         ):
             return "defer"
         return "handle"
-    try:
-        with _sessions_lock:
-            snapshot = list(_sessions.values())
-    except Exception:
-        # If we can't safely enumerate live sessions, do not deliver the event
-        # to the wrong session.  Park it rather than fail-open into user intent.
-        return "orphan"
-
-    if any(
-        s is not session and evt_key in _session_live_keys(s)
-        for s in snapshot
-    ):
+    with _sessions_lock:
+        owner = _find_live_session_by_key_locked(evt_key, exclude=session)
+    if owner is not None:
         return "defer"
-    return "orphan"
+    return "handle"
 
 
 def _notification_event_belongs_elsewhere(session: dict, evt: dict) -> bool:
     """Compatibility wrapper used by older tests/callers."""
     return _notification_event_route(session, evt) != "handle"
-
-
-def _park_orphaned_notification(evt: dict, *, reason: str = "orphaned") -> None:
-    """Keep bounded diagnostics for a completion event with no live owner."""
-    record = {
-        "parked_at": time.time(),
-        "reason": reason,
-        "session_key": str(evt.get("session_key") or ""),
-        "type": evt.get("type", "completion"),
-        "event": dict(evt),
-    }
-    _orphaned_notifications.append(record)
-    del _orphaned_notifications[:-_MAX_ORPHANED_NOTIFICATIONS]
-
-
-def _notification_persist_user_message(evt: dict) -> str:
-    """Short durable transcript marker for runtime-triggered turns.
-
-    The live model prompt still receives the formatted notification, but the DB
-    transcript should not preserve large foreign result blobs as if a human
-    typed them.  Store a compact, typed provenance marker instead.
-    """
-    evt_type = evt.get("type", "completion")
-    if evt_type == "async_delegation":
-        delegation_id = evt.get("delegation_id") or "unknown"
-        return (
-            "Runtime notification for this session: async delegation "
-            f"{delegation_id} completed."
-        )
-    session_id = evt.get("session_id") or "unknown"
-    if evt_type == "watch_match":
-        return (
-            "Runtime notification for this session: background process "
-            f"{session_id} matched watch pattern."
-        )
-    return (
-        "Runtime notification for this session: background process "
-        f"{session_id} completed."
-    )
 
 
 def _notification_event_dedup_key(evt: dict) -> tuple:

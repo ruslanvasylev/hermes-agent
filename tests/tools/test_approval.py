@@ -177,13 +177,23 @@ class TestSessionKeyContext:
         finally:
             approval_module.reset_current_session_key(token)
 
-    def test_empty_session_context_falls_back_to_process_env(self):
+    def test_unset_session_context_falls_back_to_process_env(self):
+        from gateway.session_context import _UNSET, _VAR_MAP
+
+        token = _VAR_MAP["HERMES_SESSION_KEY"].set(_UNSET)
+        try:
+            with mock_patch.dict("os.environ", {"HERMES_SESSION_KEY": "bob"}, clear=False):
+                assert approval_module.get_current_session_key() == "bob"
+        finally:
+            _VAR_MAP["HERMES_SESSION_KEY"].reset(token)
+
+    def test_empty_session_context_suppresses_process_env(self):
         from gateway.session_context import _VAR_MAP
 
         token = _VAR_MAP["HERMES_SESSION_KEY"].set("")
         try:
             with mock_patch.dict("os.environ", {"HERMES_SESSION_KEY": "bob"}, clear=False):
-                assert approval_module.get_current_session_key() == "bob"
+                assert approval_module.get_current_session_key() == ""
         finally:
             _VAR_MAP["HERMES_SESSION_KEY"].reset(token)
 
@@ -1843,11 +1853,13 @@ class TestApprovalTimeoutIsNotConsent:
         os.environ.pop("HERMES_CRON_SESSION", None)
         os.environ["HERMES_GATEWAY_SESSION"] = "1"
         os.environ["HERMES_SESSION_KEY"] = self.SESSION_KEY
+        self._approval_session_token = mod.set_current_session_key(self.SESSION_KEY)
 
     def teardown_method(self):
         from tools import approval as mod
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
+        mod.reset_current_session_key(self._approval_session_token)
         for k, v in self._saved_env.items():
             if v is None:
                 os.environ.pop(k, None)

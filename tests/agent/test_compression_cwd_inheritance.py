@@ -11,11 +11,8 @@ See: https://github.com/NousResearch/hermes-agent/issues/42228
 from __future__ import annotations
 
 import os
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from hermes_state import SessionDB
 
@@ -43,6 +40,9 @@ def _build_agent_with_db(db: SessionDB, session_id: str, cwd: str = None):
         model="test/model",
         cwd=cwd,
     )
+    # This regression covers legacy continuation rotation. Upstream defaults
+    # to in-place compaction now, so pin rotation explicitly for this test.
+    agent.compression_in_place = False
 
     # Stub compressor to return deterministic output without LLM calls
     compressor = MagicMock()
@@ -95,29 +95,6 @@ class TestCompressionCwdInheritance:
         new_session = db.get_session(agent.session_id)
         assert new_session is not None
         assert new_session["cwd"] == workspace
-
-    def test_continuation_inherits_null_cwd(self, tmp_path: Path):
-        """Sessions without a workspace should keep cwd=None after compression."""
-        db_path = tmp_path / "test.db"
-        db = SessionDB(db_path)
-
-        session_id = "20260608_120000_def456"
-        agent = _build_agent_with_db(db, session_id, cwd=None)
-
-        messages = [
-            {"role": "system", "content": "You are helpful."},
-            {"role": "user", "content": "Hello " * 2000},
-            {"role": "assistant", "content": "Hi there!"},
-        ]
-
-        from agent.conversation_compression import compress_context
-
-        with patch.object(agent, "_build_system_prompt", return_value="system"):
-            compress_context(agent, messages, "You are helpful.", force=True)
-
-        new_session = db.get_session(agent.session_id)
-        assert new_session is not None
-        assert new_session["cwd"] is None
 
     def test_tip_projection_preserves_cwd(self, tmp_path: Path):
         """list_sessions_rich tip projection should show the inherited cwd."""

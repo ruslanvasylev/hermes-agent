@@ -161,10 +161,7 @@ def get_current_session_key(default: str = "default") -> str:
     if session_key:
         return session_key
     from gateway.session_context import get_session_env
-    session_key = get_session_env("HERMES_SESSION_KEY", "")
-    if session_key:
-        return session_key
-    return os.getenv("HERMES_SESSION_KEY") or default
+    return get_session_env("HERMES_SESSION_KEY", default)
 
 
 _DB_SESSION_ID_RE = re.compile(r"^\d{8}_\d{6}_[0-9a-fA-F]{6}$")

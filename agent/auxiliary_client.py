@@ -343,7 +343,7 @@ def _compression_threshold_for_model(
         return _CODEX_GPT55_COMPACTION_THRESHOLD
     return None
 
-# Default auxiliary models for direct API-key providers (cheap/fast for side tasks)
+# Default auxiliary models for direct providers (cheap/fast for side tasks)
 def _get_aux_model_for_provider(provider_id: str) -> str:
     """Return the cheap auxiliary model for a provider.
 
@@ -362,7 +362,8 @@ def _get_aux_model_for_provider(provider_id: str) -> str:
 
 # Fallback for providers not yet migrated to ProviderProfile.default_aux_model,
 # plus providers we intentionally keep pinned here (e.g. Anthropic predates
-# profiles). New providers should set default_aux_model on their profile instead.
+# profiles; Bedrock uses AWS SDK auth). New providers should set
+# default_aux_model on their profile instead.
 _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
     "gemini": "gemini-3-flash-preview",
     "zai": "glm-4.5-flash",
@@ -376,6 +377,7 @@ _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
     "kilocode": "google/gemini-3-flash-preview",
     "ollama-cloud": "nemotron-3-nano:30b",
     "tencent-tokenhub": "hy3-preview",
+    "bedrock": "anthropic.claude-haiku-4-5-20251001-v1:0",
 }
 
 # Legacy alias — callers that haven't been updated to _get_aux_model_for_provider()

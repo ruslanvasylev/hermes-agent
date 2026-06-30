@@ -595,7 +595,8 @@ class TestAuxiliaryClientBedrockResolution:
         monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
 
         with patch("agent.anthropic_adapter.build_anthropic_bedrock_client",
-                   return_value=MagicMock()):
+                   return_value=MagicMock()), \
+             patch("agent.auxiliary_client._read_main_model", return_value="gpt-5-codex"):
             from agent.auxiliary_client import resolve_provider_client
             _, model = resolve_provider_client("bedrock", None)
 

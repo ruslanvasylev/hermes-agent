@@ -22,6 +22,8 @@ import time
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
+from agent.native_request import DispatchPolicy, NativeAdmissionError
+
 logger = logging.getLogger(__name__)
 
 
@@ -429,6 +431,13 @@ _TERMINAL_EVENT_TYPES = frozenset({
     "response.failed",
 })
 
+_NATIVE_PASSIVE_OUTPUT_TYPES = frozenset({"message", "reasoning"})
+_NATIVE_TOOL_EVENT_MARKERS = (
+    "function_call", "custom_tool", "web_search", "file_search",
+    "code_interpreter", "image_generation", "computer_call",
+    "local_shell", "function_shell", "apply_patch", "mcp_",
+)
+
 
 def _event_field(event: Any, name: str, default: Any = None) -> Any:
     """Field access that handles both attr-style (SDK objects) and dict (raw JSON) events."""
@@ -436,6 +445,16 @@ def _event_field(event: Any, name: str, default: Any = None) -> Any:
     if value is None and isinstance(event, dict):
         value = event.get(name, default)
     return value if value is not None else default
+
+
+def _native_passive_output(item: Any) -> bool:
+    """Only text/reasoning items can prove a tool-free native response.
+
+    The pinned SDK's ResponseOutputItem union includes client and server-side
+    executable calls.  A closed allowlist also rejects unfamiliar future
+    variants until their semantics have been reviewed.
+    """
+    return _event_field(item, "type") in _NATIVE_PASSIVE_OUTPUT_TYPES
 
 
 def _raise_stream_error(event: Any) -> None:
@@ -462,6 +481,7 @@ def _consume_codex_event_stream(
     on_first_delta=None,
     on_event=None,
     interrupt_check=None,
+    native_strict: bool = False,
 ) -> SimpleNamespace:
     """Consume a Codex Responses SSE event stream and return a final response.
 
@@ -481,9 +501,10 @@ def _consume_codex_event_stream(
     * ``error``: passed through for ``response.failed`` frames.
     * ``model``: from kwargs (the wire model name is not authoritative).
 
-    Critically, we never read ``response.output`` from the terminal event for
-    content reconstruction — only ``usage``, ``status``, ``id``.  That field
-    being ``null`` / ``[]`` / missing is fine.
+    We never read ``response.output`` from the terminal event for content
+    reconstruction.  Strict native admission inspects its item types to rule
+    out tool calls absent from the streamed output_item.done frames.  A null,
+    empty, or missing output remains valid if the stream otherwise qualifies.
 
     Callbacks:
 
@@ -506,6 +527,10 @@ def _consume_codex_event_stream(
     terminal_incomplete_details: Any = None
     terminal_error: Any = None
     saw_terminal = False
+    terminal_event_count = 0
+    terminal_model: str | None = None
+    terminal_output: Any = None
+    tool_call_count = 0
 
     for event in event_iter:
         if on_event is not None:
@@ -520,11 +545,26 @@ def _consume_codex_event_stream(
                 # stream consumption.
                 logger.debug("Codex stream on_event hook raised", exc_info=True)
         if interrupt_check is not None and interrupt_check():
+            if native_strict:
+                raise NativeAdmissionError("native_stream_interrupted")
             break
 
         event_type = _event_field(event, "type", "")
         if not isinstance(event_type, str):
             event_type = ""
+
+        if native_strict and saw_terminal:
+            if event_type in _TERMINAL_EVENT_TYPES:
+                raise NativeAdmissionError("native_duplicate_terminal")
+            raise NativeAdmissionError("native_post_terminal_event")
+
+        if native_strict:
+            if any(marker in event_type for marker in _NATIVE_TOOL_EVENT_MARKERS):
+                raise NativeAdmissionError("native_tool_call")
+            if event_type.startswith("response.output_item."):
+                event_item = _event_field(event, "item")
+                if event_item is not None and not _native_passive_output(event_item):
+                    raise NativeAdmissionError("native_tool_call")
 
         # ``error`` SSE frames carry the provider's real failure reason
         # (subscription / quota / model-not-available / rejected-reasoning-replay)
@@ -554,6 +594,7 @@ def _consume_codex_event_stream(
 
         if "function_call" in event_type:
             has_tool_calls = True
+            tool_call_count += 1
             # fall through — function_call items still get added on output_item.done
 
         if "reasoning" in event_type and "delta" in event_type:
@@ -569,10 +610,14 @@ def _consume_codex_event_stream(
             done_item = _event_field(event, "item")
             if done_item is not None:
                 collected_output_items.append(done_item)
+                if _event_field(done_item, "type") == "function_call" and not has_tool_calls:
+                    has_tool_calls = True
+                    tool_call_count += 1
             continue
 
         if event_type in _TERMINAL_EVENT_TYPES:
             saw_terminal = True
+            terminal_event_count += 1
             resp_obj = _event_field(event, "response")
             if resp_obj is not None:
                 terminal_usage = getattr(resp_obj, "usage", None)
@@ -582,6 +627,9 @@ def _consume_codex_event_stream(
                 if rid is None and isinstance(resp_obj, dict):
                     rid = resp_obj.get("id")
                 terminal_response_id = rid
+                terminal_model = _event_field(resp_obj, "model")
+                if native_strict:
+                    terminal_output = _event_field(resp_obj, "output")
                 rstatus = getattr(resp_obj, "status", None)
                 if rstatus is None and isinstance(resp_obj, dict):
                     rstatus = resp_obj.get("status")
@@ -601,8 +649,27 @@ def _consume_codex_event_stream(
                 terminal_status = terminal_status or "incomplete"
             elif event_type == "response.failed":
                 terminal_status = terminal_status or "failed"
-            # Stop on terminal event.
-            break
+            # Strict admission must consume to iterator exhaustion to detect
+            # duplicate/post-terminal frames.  Ordinary streaming keeps its
+            # historical stop-on-terminal behavior.
+            if not native_strict:
+                break
+
+    if native_strict:
+        if terminal_event_count != 1 or not saw_terminal:
+            raise NativeAdmissionError("native_terminal_missing")
+        if terminal_status != "completed" or event_type != "response.completed":
+            raise NativeAdmissionError("native_terminal_not_completed")
+        if not isinstance(terminal_response_id, str) or not terminal_response_id.strip():
+            raise NativeAdmissionError("native_provider_response_id_missing")
+        if not isinstance(terminal_model, str) or not terminal_model.strip() or terminal_model != model:
+            raise NativeAdmissionError("native_provider_model_mismatch")
+        if terminal_output is not None and (
+                not isinstance(terminal_output, list)
+                or any(not _native_passive_output(item) for item in terminal_output)):
+            raise NativeAdmissionError("native_tool_call")
+        if has_tool_calls or any(_event_field(item, "type") == "function_call" for item in collected_output_items):
+            raise NativeAdmissionError("native_tool_call")
 
     # Build the final output list.  Prefer items observed via output_item.done;
     # if none arrived but we streamed plain text deltas (no tool calls), synthesize
@@ -639,14 +706,18 @@ def _consume_codex_event_stream(
         usage=terminal_usage,
         status=terminal_status,
         id=terminal_response_id,
-        model=model,
+        model=terminal_model if native_strict else model,
         incomplete_details=terminal_incomplete_details,
         error=terminal_error,
+        native_terminal_event_count=terminal_event_count if native_strict else None,
+        native_stream_exhausted=True if native_strict else None,
+        native_tool_call_count=tool_call_count if native_strict else None,
     )
     return final
 
 
-def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
+def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None,
+                     native_policy: DispatchPolicy | None = None):
     """Execute one streaming Responses API request and return the final response.
 
     Uses ``responses.create(stream=True)`` (low-level raw event iteration)
@@ -658,7 +729,14 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     import httpx as _httpx
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
+    native_policy = native_policy or getattr(agent, "_native_dispatch_policy", None)
+    if native_policy is not None:
+        if not isinstance(native_policy, DispatchPolicy):
+            raise NativeAdmissionError("native_policy_invalid")
+        native_policy.require_client(active_client)
     max_stream_retries = 1
+    if native_policy is not None:
+        max_stream_retries = 0
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
 
@@ -679,6 +757,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
+            if native_policy is not None:
+                raise NativeAdmissionError("native_stream_interrupted")
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
         stream_kwargs = dict(api_kwargs)
@@ -687,6 +767,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         try:
             event_stream = active_client.responses.create(**stream_kwargs)
         except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+            if native_policy is not None:
+                raise NativeAdmissionError("native_stream_connect_failed") from exc
             if attempt < max_stream_retries:
                 logger.debug(
                     "Codex Responses stream connect failed (attempt %s/%s); retrying. %s error=%s",
@@ -695,11 +777,18 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 )
                 continue
             raise
+        except Exception as exc:
+            if native_policy is not None:
+                raise NativeAdmissionError("native_stream_connect_failed") from exc
+            raise
 
+        stream_closed = False
         try:
             # Compatibility: some mocks/providers return a concrete response
             # instead of an iterable.  Pass it straight through.
             if hasattr(event_stream, "output") and not hasattr(event_stream, "__iter__"):
+                if native_policy is not None:
+                    raise NativeAdmissionError("native_non_stream_response")
                 return event_stream
 
             try:
@@ -711,8 +800,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_first_delta=on_first_delta,
                     on_event=_on_event,
                     interrupt_check=_interrupt_check,
+                    native_strict=native_policy is not None,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                if native_policy is not None:
+                    raise NativeAdmissionError("native_stream_transport_failed") from exc
                 if attempt < max_stream_retries:
                     logger.debug(
                         "Codex Responses stream transport failed mid-iteration "
@@ -722,6 +814,25 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     )
                     continue
                 raise
+            except NativeAdmissionError:
+                raise
+            except Exception as exc:
+                if native_policy is not None:
+                    raise NativeAdmissionError("native_stream_consumption_failed") from exc
+                raise
+
+            if native_policy is not None:
+                close_fn = getattr(event_stream, "close", None)
+                if not callable(close_fn):
+                    raise NativeAdmissionError("native_stream_close_unavailable")
+                try:
+                    close_fn()
+                except Exception as exc:
+                    raise NativeAdmissionError("native_stream_close_failed") from exc
+                stream_closed = True
+                final.native_stream_closed = True
+                final.native_attempt = native_policy.observe(final)
+                return final
 
             if final.status in {"incomplete", "failed"}:
                 logger.warning(
@@ -735,11 +846,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             return final
         finally:
             close_fn = getattr(event_stream, "close", None)
-            if callable(close_fn):
+            if callable(close_fn) and not stream_closed:
                 try:
                     close_fn()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    if native_policy is not None:
+                        raise NativeAdmissionError("native_stream_close_failed") from exc
 
 
 def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None):

@@ -6,7 +6,7 @@ physical attempt, and neither object signs or admits a downstream result.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import threading
 from typing import Any, Callable, Literal
@@ -162,6 +162,15 @@ class GuardedTransport(httpx.BaseTransport):
 @dataclass(frozen=True)
 class DispatchPolicy:
     guard: GuardedTransport
+    _observation: AttemptObservation | None = field(default=None, init=False, repr=False, compare=False)
+    _observation_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False,
+    )
+
+    @property
+    def observation(self) -> AttemptObservation | None:
+        """The original stream-owned record, kept off the mutable response."""
+        return self._observation
 
     def require_client(self, client: Any) -> None:
         http_client = getattr(client, "_client", None)
@@ -176,17 +185,61 @@ class DispatchPolicy:
             raise NativeAdmissionError("native_sdk_retry_enabled")
 
     def observe(self, final: Any) -> AttemptObservation:
-        guard = self.guard
-        if guard.send_count != 1 or not guard.physical_attempt_id:
-            raise NativeAdmissionError("native_physical_attempt_missing")
-        return AttemptObservation(
-            physical_attempt_id=guard.physical_attempt_id,
-            prepared=guard.prepared,
-            provider_response_id=final.id,
-            provider_model=final.model,
-            response_status=final.status,
-            terminal_event_count=final.native_terminal_event_count,
-            stream_exhausted=final.native_stream_exhausted,
-            stream_closed=final.native_stream_closed,
-            tool_call_count=final.native_tool_call_count,
-        )
+        with self._observation_lock:
+            if self._observation is not None:
+                raise NativeAdmissionError("native_observation_reissued")
+            guard = self.guard
+            if guard.send_count != 1 or not guard.physical_attempt_id:
+                raise NativeAdmissionError("native_physical_attempt_missing")
+            observation = AttemptObservation(
+                physical_attempt_id=guard.physical_attempt_id,
+                prepared=guard.prepared,
+                provider_response_id=final.id,
+                provider_model=final.model,
+                response_status=final.status,
+                terminal_event_count=final.native_terminal_event_count,
+                stream_exhausted=final.native_stream_exhausted,
+                stream_closed=final.native_stream_closed,
+                tool_call_count=final.native_tool_call_count,
+            )
+            object.__setattr__(self, "_observation", observation)
+            return observation
+
+
+@dataclass
+class NativeRequestTurn:
+    """One-use request policy passed explicitly through a protected turn."""
+
+    phase: Literal["prepare", "dispatch"]
+    prepared: PreparedRequest | None = None
+    delegate_factory: Callable[[], httpx.BaseTransport] | None = None
+    dispatch_policy: DispatchPolicy | None = field(default=None, init=False)
+    _claimed: bool = field(default=False, init=False, repr=False)
+
+    def claim(self) -> None:
+        if self._claimed:
+            raise NativeAdmissionError("native_turn_reused")
+        if self.phase == "prepare":
+            if self.prepared is not None or self.delegate_factory is not None:
+                raise NativeAdmissionError("native_prepare_input_invalid")
+        elif self.phase == "dispatch":
+            if not isinstance(self.prepared, PreparedRequest):
+                raise NativeAdmissionError("native_dispatch_preparation_missing")
+        else:
+            raise NativeAdmissionError("native_turn_phase_invalid")
+        self._claimed = True
+
+
+@dataclass(frozen=True)
+class NativePreparationResult:
+    prepared: PreparedRequest
+
+
+@dataclass(frozen=True)
+class NativeExecutionResult:
+    response: Any
+    attempt: AttemptObservation
+    outer_callback_count: int
+    outer_retry_count: int
+    fallback_activated: bool
+    compression_count: int

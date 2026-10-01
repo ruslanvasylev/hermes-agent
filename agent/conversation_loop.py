@@ -56,6 +56,10 @@ from agent.model_metadata import (
     parse_available_output_tokens_from_error,
     save_context_length,
 )
+from agent.native_request import (
+    AttemptObservation, NativeAdmissionError, NativeExecutionResult,
+    NativePreparationResult, NativeRequestTurn, NativeTurnContext,
+)
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import adaptive_rate_limit_backoff, jittered_backoff
@@ -505,6 +509,7 @@ def run_conversation(
     persist_user_message: Optional[str] = None,
     persist_user_timestamp: Optional[float] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    native_turn: NativeRequestTurn | None = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -527,7 +532,17 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
-    if moa_config is None:
+    if native_turn is not None:
+        if not isinstance(native_turn, NativeRequestTurn):
+            raise NativeAdmissionError("native_turn_invalid")
+        native_turn.claim()
+        if (agent.api_mode != "codex_responses" or agent.provider == "nous"
+                or getattr(agent, "_disable_streaming", False)
+                or getattr(agent, "_budget_grace_call", False)
+                or agent.max_iterations < 1 or moa_config is not None):
+            raise NativeAdmissionError("native_turn_route_unsupported")
+
+    if moa_config is None and native_turn is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
 
@@ -564,6 +579,7 @@ def run_conversation(
         set_session_context=set_session_context,
         set_current_write_origin=set_current_write_origin,
         ra=_ra,
+        native_context=NativeTurnContext(native_turn.phase) if native_turn is not None else None,
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
@@ -982,7 +998,7 @@ def run_conversation(
         
         api_start_time = time.time()
         retry_count = 0
-        max_retries = agent._api_max_retries
+        max_retries = 1 if native_turn is not None else agent._api_max_retries
         _retry = TurnRetryState()
         max_compression_attempts = 3
 
@@ -1078,6 +1094,8 @@ def run_conversation(
                     _original_api_kwargs = _llm_request_mw.original_payload
                     _llm_middleware_trace = _llm_request_mw.trace
                 except Exception:
+                    if native_turn is not None:
+                        raise
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
 
@@ -1195,7 +1213,25 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
+                _native_call_count = 0
+                _native_actual_result = None
+
                 def _perform_api_call(next_api_kwargs):
+                    nonlocal _native_call_count, _native_actual_result
+                    if native_turn is not None:
+                        _native_call_count += 1
+                        if _native_call_count != 1:
+                            raise NativeAdmissionError("native_outer_callback_repeated")
+                        if native_turn.phase == "prepare":
+                            _native_actual_result = NativePreparationResult(
+                                agent._prepare_native_request(next_api_kwargs)
+                            )
+                            return _native_actual_result
+                        _native_actual_result = agent._interruptible_streaming_api_call(
+                            next_api_kwargs, on_first_delta=_stop_spinner,
+                            native_turn=native_turn,
+                        )
+                        return _native_actual_result
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -1219,7 +1255,40 @@ def run_conversation(
                     api_mode=agent.api_mode,
                     api_call_count=api_call_count,
                     middleware_trace=list(_llm_middleware_trace),
+                    require_single_execution=native_turn is not None,
                 )
+
+                if native_turn is not None:
+                    _stop_spinner()
+                    if _native_call_count != 1 or response is not _native_actual_result:
+                        raise NativeAdmissionError("native_execution_result_not_owned")
+                    if native_turn.phase == "prepare":
+                        if not isinstance(response, NativePreparationResult):
+                            raise NativeAdmissionError("native_preparation_missing")
+                        return response
+                    policy = native_turn.dispatch_policy
+                    observation = policy.observation if policy is not None else None
+                    if (not isinstance(observation, AttemptObservation) or policy is None
+                            or getattr(response, "native_attempt", None) is not observation
+                            or getattr(response, "id", None) != observation.provider_response_id
+                            or getattr(response, "model", None) != observation.provider_model
+                            or getattr(response, "status", None) != observation.response_status
+                            or getattr(response, "native_terminal_event_count", None) != observation.terminal_event_count
+                            or getattr(response, "native_stream_exhausted", None) != observation.stream_exhausted
+                            or getattr(response, "native_stream_closed", None) != observation.stream_closed
+                            or getattr(response, "native_tool_call_count", None) != observation.tool_call_count
+                            or policy.guard.send_count != 1 or retry_count != 0
+                            or compression_attempts != 0
+                            or getattr(agent, "_fallback_activated", False)):
+                        raise NativeAdmissionError("native_execution_observation_invalid")
+                    return NativeExecutionResult(
+                        response=response,
+                        attempt=observation,
+                        outer_callback_count=_native_call_count,
+                        outer_retry_count=retry_count,
+                        fallback_activated=bool(getattr(agent, "_fallback_activated", False)),
+                        compression_count=compression_attempts,
+                    )
                 
                 api_duration = time.time() - api_start_time
                 
@@ -2076,6 +2145,8 @@ def run_conversation(
                 break  # Success, exit retry loop
 
             except InterruptedError:
+                if native_turn is not None:
+                    raise NativeAdmissionError("native_outer_interrupted")
                 if thinking_spinner:
                     thinking_spinner.stop("")
                     thinking_spinner = None
@@ -2101,6 +2172,8 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                if native_turn is not None:
+                    raise
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:

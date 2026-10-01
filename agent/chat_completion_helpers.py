@@ -152,7 +152,7 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def interruptible_api_call(agent, api_kwargs: dict):
+def interruptible_api_call(agent, api_kwargs: dict, *, native_turn=None):
     """
     Run the API call in a background thread so the main conversation loop
     can detect interrupts without waiting for the full HTTP round-trip.
@@ -227,12 +227,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     agent._create_request_openai_client(
                         reason="codex_stream_request",
                         api_kwargs=api_kwargs,
+                        **({"native_turn": native_turn} if native_turn is not None else {}),
                     )
                 )
                 result["response"] = agent._run_codex_stream(
                     api_kwargs,
                     client=request_client,
                     on_first_delta=getattr(agent, "_codex_on_first_delta", None),
+                    **({"native_policy": native_turn.dispatch_policy} if native_turn is not None else {}),
                 )
             elif agent.api_mode == "anthropic_messages":
                 result["response"] = agent._anthropic_messages_create(api_kwargs)
@@ -1689,7 +1691,8 @@ def cleanup_task_resources(agent, task_id: str) -> None:
 
 
 
-def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
+def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None,
+                                     native_turn=None):
     """Streaming variant of _interruptible_api_call for real-time token delivery.
 
     Handles all three api_modes:
@@ -1715,6 +1718,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # temporarily so _run_codex_stream can pick it up.
         agent._codex_on_first_delta = on_first_delta
         try:
+            if native_turn is not None:
+                return agent._interruptible_api_call(api_kwargs, native_turn=native_turn)
             return agent._interruptible_api_call(api_kwargs)
         finally:
             agent._codex_on_first_delta = None

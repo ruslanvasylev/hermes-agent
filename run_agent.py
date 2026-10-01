@@ -3781,28 +3781,35 @@ class AIAgent:
         return False
 
     @staticmethod
+    def _keepalive_socket_options() -> list:
+        import socket as _socket
+
+        options = [(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)]
+        if hasattr(_socket, "TCP_KEEPIDLE"):
+            options.extend([
+                (_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 30),
+                (_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, 10),
+                (_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 3),
+            ])
+        elif hasattr(_socket, "TCP_KEEPALIVE"):
+            options.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPALIVE, 30))
+        return options
+
+    @staticmethod
     def _build_keepalive_http_client(base_url: str = "") -> Any:
         try:
             import httpx as _httpx
-            import socket as _socket
 
             if "api.githubcopilot.com" in str(base_url or "").lower():
                 return _httpx.Client()
 
-            _sock_opts = [(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)]
-            if hasattr(_socket, "TCP_KEEPIDLE"):
-                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 30))
-                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, 10))
-                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 3))
-            elif hasattr(_socket, "TCP_KEEPALIVE"):
-                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPALIVE, 30))
             # When a custom transport is provided, httpx won't auto-read proxy
             # from env vars (allow_env_proxies = trust_env and transport is None).
             # Explicitly read proxy settings while still honoring NO_PROXY for
             # loopback / local endpoints such as a locally hosted sub2api.
             _proxy = _get_proxy_for_base_url(base_url)
             return _httpx.Client(
-                transport=_httpx.HTTPTransport(socket_options=_sock_opts),
+                transport=_httpx.HTTPTransport(socket_options=AIAgent._keepalive_socket_options()),
                 proxy=_proxy,
             )
         except Exception:
@@ -3925,8 +3932,68 @@ class AIAgent:
 
         return copilot_request_headers(is_agent_turn=True, is_vision=is_vision)
 
-    def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
+    def _native_openai_client_kwargs(self, api_kwargs: dict) -> dict:
+        from agent.native_request import NativeAdmissionError
+
+        if self.api_mode != "codex_responses" or self.provider in {"moa", "copilot-acp", "gemini"}:
+            raise NativeAdmissionError("native_client_mode_unsupported")
+        with self._openai_client_lock():
+            kwargs = dict(self._client_kwargs)
+        if "http_client" in kwargs or "http_transport" in kwargs:
+            raise NativeAdmissionError("native_custom_client_unsupported")
+        if base_url_host_matches(str(kwargs.get("base_url", "")), "githubcopilot.com"):
+            raise NativeAdmissionError("native_copilot_route_unsupported")
+        kwargs["max_retries"] = 0
+        return kwargs
+
+    def _prepare_native_request(self, api_kwargs: dict):
+        import openai
+        from agent.native_request import capture_responses_request
+
+        kwargs = self._native_openai_client_kwargs(api_kwargs)
+        return capture_responses_request(
+            lambda http_client: openai.OpenAI(**kwargs, http_client=http_client),
+            api_kwargs,
+        )
+
+    def _create_native_request_client(self, native_turn, api_kwargs: dict):
+        import httpx
+        import openai
+        from agent.native_request import (
+            DispatchPolicy, GuardedTransport, NativeAdmissionError,
+            _SUPPORTED_OPENAI_SDK_VERSION,
+        )
+
+        if openai.__version__ != _SUPPORTED_OPENAI_SDK_VERSION:
+            raise NativeAdmissionError("native_sdk_version_unsupported")
+        kwargs = self._native_openai_client_kwargs(api_kwargs)
+        if native_turn.delegate_factory is None:
+            delegate = httpx.HTTPTransport(
+                proxy=_get_proxy_for_base_url(str(kwargs.get("base_url", ""))),
+                socket_options=self._keepalive_socket_options(),
+            )
+        else:
+            delegate = native_turn.delegate_factory()
+        if not isinstance(delegate, httpx.BaseTransport):
+            raise NativeAdmissionError("native_transport_unsupported")
+        guard = GuardedTransport(delegate, native_turn.prepared)
+        http_client = httpx.Client(transport=guard, trust_env=False)
+        try:
+            client = openai.OpenAI(**kwargs, http_client=http_client)
+            policy = DispatchPolicy(guard)
+            policy.require_client(client)
+        except Exception:
+            http_client.close()
+            raise
+        native_turn.dispatch_policy = policy
+        return client
+
+    def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None,
+                                      native_turn=None) -> Any:
         from unittest.mock import Mock
+
+        if native_turn is not None:
+            return self._create_native_request_client(native_turn, api_kwargs or {})
 
         primary_client = self._ensure_primary_openai_client(reason=reason)
         if self.provider == "moa":
@@ -3989,10 +4056,11 @@ class AIAgent:
                 exc,
             )
 
-    def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
+    def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None,
+                          native_policy=None):
         """Forwarder — see ``agent.codex_runtime.run_codex_stream``."""
         from agent.codex_runtime import run_codex_stream
-        return run_codex_stream(self, api_kwargs, client, on_first_delta)
+        return run_codex_stream(self, api_kwargs, client, on_first_delta, native_policy=native_policy)
 
     def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
         """Forwarder — see ``agent.codex_runtime.run_codex_create_stream_fallback``."""
@@ -4368,10 +4436,10 @@ class AIAgent:
                 drop_context_1m_beta=_drop_1m,
             )
 
-    def _interruptible_api_call(self, api_kwargs: dict):
+    def _interruptible_api_call(self, api_kwargs: dict, *, native_turn=None):
         """Forwarder — see ``agent.chat_completion_helpers.interruptible_api_call``."""
         from agent.chat_completion_helpers import interruptible_api_call
-        return interruptible_api_call(self, api_kwargs)
+        return interruptible_api_call(self, api_kwargs, native_turn=native_turn)
 
     # ── Unified streaming API call ─────────────────────────────────────────
 
@@ -4540,11 +4608,14 @@ class AIAgent:
         )
 
     def _interruptible_streaming_api_call(
-        self, api_kwargs: dict, *, on_first_delta: callable = None
+        self, api_kwargs: dict, *, on_first_delta: callable = None,
+        native_turn=None,
     ):
         """Forwarder — see ``agent.chat_completion_helpers.interruptible_streaming_api_call``."""
         from agent.chat_completion_helpers import interruptible_streaming_api_call
-        return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
+        return interruptible_streaming_api_call(
+            self, api_kwargs, on_first_delta=on_first_delta, native_turn=native_turn,
+        )
 
     def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
@@ -5546,6 +5617,7 @@ class AIAgent:
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        native_turn=None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.conversation_loop import run_conversation
@@ -5559,6 +5631,7 @@ class AIAgent:
             persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             moa_config=moa_config,
+            native_turn=native_turn,
         )
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:

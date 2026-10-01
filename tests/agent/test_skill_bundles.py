@@ -184,6 +184,30 @@ class TestResolveBundleCommandKey:
 
 
 class TestBuildBundleInvocationMessage:
+    def test_preparation_loads_members_without_usage_or_setup_effects(self, bundles_env, monkeypatch):
+        from agent.native_request import NativeAdmissionError
+        bundles_dir, skills_dir = bundles_env
+        _make_skill(skills_dir, "pure", body="Pure bundle body")
+        _make_bundle_yaml(bundles_dir, "combo", ["pure"])
+        scan_bundles()
+        usage_path = skills_dir / ".usage.json"
+        before = b'{"pure":{"use_count":4}}\n'
+        usage_path.write_bytes(before)
+        monkeypatch.setattr("tools.skill_usage.bump_use",
+                            lambda *a, **k: pytest.fail("speculative bundle usage"))
+        message, loaded, missing = build_bundle_invocation_message(
+            "/combo", record_usage=False, preparation=True,
+        )
+        assert loaded == ["pure"] and missing == []
+        assert "Pure bundle body" in message
+        assert usage_path.read_bytes() == before
+
+        _make_bundle_yaml(bundles_dir, "combo", ["pure", "missing"])
+        scan_bundles()
+        with pytest.raises(NativeAdmissionError, match="cron_native_skill_load_declined"):
+            build_bundle_invocation_message("/combo", record_usage=False, preparation=True)
+        assert usage_path.read_bytes() == before
+
     def test_loads_all_skills(self, bundles_env):
         bundles_dir, skills_dir = bundles_env
         _make_skill(skills_dir, "skill-a", body="Skill A content.")

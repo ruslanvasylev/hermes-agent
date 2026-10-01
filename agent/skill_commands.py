@@ -135,7 +135,8 @@ def _resolve_skill_commands_platform() -> Optional[str]:
         resolved_platform = os.getenv("HERMES_PLATFORM")
     return resolved_platform or None
 
-def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
+def _load_skill_payload(skill_identifier: str, task_id: str | None = None,
+                        *, read_only: bool = False) -> tuple[dict[str, Any], Path | None, str] | None:
     """Load a skill by name/path and return (loaded_payload, skill_dir, display_name)."""
     raw_identifier = (skill_identifier or "").strip()
     if not raw_identifier:
@@ -175,13 +176,22 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         else:
             normalized = raw_identifier.lstrip("/")
 
-        loaded_skill = json.loads(
-            skill_view(normalized, task_id=task_id, preprocess=False)
-        )
-    except Exception:
+        view_kwargs = {"task_id": task_id, "preprocess": False}
+        if read_only:
+            view_kwargs["read_only"] = True
+        loaded_skill = json.loads(skill_view(normalized, **view_kwargs))
+    except Exception as exc:
+        if read_only:
+            from agent.native_request import NativeAdmissionError
+            raise NativeAdmissionError("cron_native_skill_load_failed") from exc
         return None
 
     if not loaded_skill.get("success"):
+        if read_only:
+            from agent.native_request import NativeAdmissionError
+            raise NativeAdmissionError(
+                f"cron_native_skill_load_declined: {loaded_skill.get('error') or normalized}"
+            )
         return None
 
     skill_name = str(loaded_skill.get("name") or normalized)

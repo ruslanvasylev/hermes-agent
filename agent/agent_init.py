@@ -235,6 +235,8 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    preparation_context_length: int | None = None,
+    frozen_nous_subscription_prompt: str | None = None,
 ):
     """
     Initialize the AI Agent.
@@ -285,6 +287,30 @@ def init_agent(
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
     """
+    if preparation_context_length is not None:
+        from agent.native_request import NativeAdmissionError
+        from hermes_cli.config import (
+            get_custom_provider_context_length, load_config_readonly,
+        )
+        config = load_config_readonly() or {}
+        model_config = config.get("model") or {}
+        configured = model_config.get("context_length") if isinstance(model_config, dict) else None
+        try:
+            configured = int(configured)
+        except (TypeError, ValueError):
+            configured = None
+        if not configured or configured <= 0:
+            configured = get_custom_provider_context_length(
+                model=model, base_url=base_url or "", config=config,
+            )
+        agent_config = config.get("agent") or {}
+        engine = (agent_config.get("context") or {}).get("engine", "compressor")
+        if (configured != preparation_context_length
+                or str(provider or "").lower() == "lmstudio"
+                or engine not in (None, "", "compressor")
+                or config.get("mcp_servers")):
+            raise NativeAdmissionError("cron_native_constructor_config_drift")
+
     _install_safe_stdio()
 
     agent.model = model
@@ -417,7 +443,7 @@ def init_agent(
     # AIAgent is created for every gateway request, so without the guard
     # each message leaks one OS thread and the process eventually exhausts
     # the system thread limit (RuntimeError: can't start new thread).
-    if (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
+    if preparation_context_length is None and (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
             not _ra()._openrouter_prewarm_done.is_set():
         _ra()._openrouter_prewarm_done.set()
         threading.Thread(
@@ -1146,6 +1172,11 @@ def init_agent(
     
     # Cached system prompt -- built once per session, only rebuilt on compression
     agent._cached_system_prompt: Optional[str] = None
+    if frozen_nous_subscription_prompt is not None and not isinstance(frozen_nous_subscription_prompt, str):
+        raise TypeError("frozen_nous_subscription_prompt must be a string or None")
+    # None retains the ordinary live builder.  An empty string is a resolved
+    # native result and must not trigger another entitlement lookup.
+    agent._frozen_nous_subscription_prompt = frozen_nous_subscription_prompt
     
     # Filesystem checkpoint manager (transparent — not a tool)
     from tools.checkpoint_manager import CheckpointManager
@@ -1588,6 +1619,13 @@ def init_agent(
     # Persist for reuse on switch_model / fallback activation. Must come
     # AFTER the custom_providers branch so per-model overrides aren't lost.
     agent._config_context_length = _config_context_length
+
+    if preparation_context_length is not None:
+        from agent.native_request import NativeAdmissionError
+        engine_name = (_agent_cfg.get("context") or {}).get("engine", "compressor")
+        if (agent.provider == "lmstudio" or engine_name not in (None, "", "compressor")
+                or _config_context_length != preparation_context_length):
+            raise NativeAdmissionError("cron_native_constructor_config_drift")
 
     agent._ensure_lmstudio_runtime_loaded(_config_context_length)
 

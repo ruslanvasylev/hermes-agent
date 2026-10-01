@@ -384,6 +384,15 @@ class PluginContext:
         except Exception:
             return "default"
 
+    def register_cron_native_preparation_provider(self, name: str, provider: Any) -> None:
+        """Register one trusted plugin-owned cron preparation/commit provider."""
+        if (not isinstance(name, str) or not name.strip() or name != name.strip()
+                or not callable(getattr(provider, "prepare", None))):
+            raise ValueError("invalid cron native preparation provider")
+        if name in self._manager._cron_native_preparation_providers:
+            raise ValueError(f"duplicate cron native preparation provider: {name}")
+        self._manager._cron_native_preparation_providers[name] = provider
+
     # -- tool registration --------------------------------------------------
 
     def register_tool(
@@ -1207,6 +1216,7 @@ class PluginManager:
         self._plugin_platform_names: Set[str] = set()
         self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
+        self._cron_native_preparation_providers: Dict[str, Any] = {}
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
@@ -1226,6 +1236,9 @@ class PluginManager:
     # -----------------------------------------------------------------------
     # Public
     # -----------------------------------------------------------------------
+
+    def get_cron_native_preparation_provider(self, name: str) -> Any:
+        return self._cron_native_preparation_providers.get(name)
 
     def discover_and_load(self, force: bool = False) -> None:
         """Scan all plugin sources and load each plugin found.
@@ -1256,6 +1269,7 @@ class PluginManager:
             self._aux_tasks.clear()
             self._slack_action_handlers.clear()
             self._context_engine = None
+            self._cron_native_preparation_providers.clear()
         # Set the flag up front as a re-entrancy guard (a plugin's register()
         # can transitively trigger discovery again), but reset it if the sweep
         # raises so a failed scan is NOT cached as "discovered with an empty

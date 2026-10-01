@@ -254,6 +254,8 @@ def build_bundle_invocation_message(
     cmd_key: str,
     user_instruction: str = "",
     task_id: str | None = None,
+    record_usage: bool = True,
+    preparation: bool = False,
 ) -> Optional[Tuple[str, List[str], List[str]]]:
     """Build the user message content for a bundle slash command invocation.
 
@@ -289,17 +291,29 @@ def build_bundle_invocation_message(
             continue
         seen.add(identifier)
 
-        loaded = _load_skill_payload(identifier, task_id=task_id)
+        loaded = _load_skill_payload(identifier, task_id=task_id,
+                                     **({"read_only": True} if preparation else {}))
         if not loaded:
+            if preparation:
+                from agent.native_request import NativeAdmissionError
+                raise NativeAdmissionError("cron_native_bundle_member_missing")
             missing.append(identifier)
             continue
         loaded_skill, skill_dir, skill_name = loaded
 
-        try:
-            from tools.skill_usage import bump_use
-            bump_use(skill_name)
-        except Exception:
-            pass
+        if preparation:
+            from agent.skill_preprocessing import load_skills_config, _INLINE_SHELL_RE
+            from agent.native_request import NativeAdmissionError
+            if (load_skills_config().get("inline_shell", False)
+                    and _INLINE_SHELL_RE.search(str(loaded_skill.get("content") or ""))):
+                raise NativeAdmissionError("cron_native_skill_inline_shell_unsupported")
+
+        if record_usage:
+            try:
+                from tools.skill_usage import bump_use
+                bump_use(skill_name)
+            except Exception:
+                pass
 
         activation_note = (
             f'[Loaded as part of the "{bundle_name}" skill bundle.]'

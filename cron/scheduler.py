@@ -12,6 +12,7 @@ import asyncio
 import atexit
 import concurrent.futures
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -1695,7 +1696,8 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
-def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
+def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None,
+                      *, preparation: bool = False) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
     Args:
@@ -1840,6 +1842,8 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 bundle_key,
                 user_instruction="",
                 task_id=str(job.get("id") or "") or None,
+                record_usage=not preparation,
+                preparation=preparation,
             )
             if bundle_payload:
                 bundle_message, _loaded_bundle_skills, _missing_bundle_skills = bundle_payload
@@ -1856,24 +1860,44 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             continue
 
         try:
-            loaded = json.loads(skill_view(skill_name))
+            loaded = json.loads(skill_view(
+                skill_name, preprocess=not preparation,
+                **({"read_only": True} if preparation else {}),
+            ))
         except (json.JSONDecodeError, TypeError):
+            if preparation:
+                from agent.native_request import NativeAdmissionError
+                raise NativeAdmissionError("cron_native_skill_load_failed")
             logger.warning("Cron job '%s': skill '%s' returned invalid JSON, skipping", job.get("name", job.get("id")), skill_name)
             skipped.append(skill_name)
             continue
         if not loaded.get("success"):
             error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
+            if preparation:
+                from agent.native_request import NativeAdmissionError
+                raise NativeAdmissionError(f"cron_native_skill_load_declined: {error}")
             logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
             skipped.append(skill_name)
             continue
 
         # Bump usage so the curator sees this skill as actively used.
-        try:
-            bump_use(skill_name)
-        except Exception:
-            logger.debug("Cron job: failed to bump skill usage for '%s'", skill_name, exc_info=True)
+        if not preparation:
+            try:
+                bump_use(skill_name)
+            except Exception:
+                logger.debug("Cron job: failed to bump skill usage for '%s'", skill_name, exc_info=True)
 
         content = str(loaded.get("content") or "").strip()
+        if preparation:
+            from agent.skill_preprocessing import (
+                _INLINE_SHELL_RE, load_skills_config, preprocess_skill_content,
+            )
+            from agent.native_request import NativeAdmissionError
+            if (load_skills_config().get("inline_shell", False)
+                    and _INLINE_SHELL_RE.search(content)):
+                raise NativeAdmissionError("cron_native_skill_inline_shell_unsupported")
+            skill_dir = Path(loaded["skill_dir"]) if loaded.get("skill_dir") else None
+            content = preprocess_skill_content(content, skill_dir, None).strip()
         if parts:
             parts.append("")
         parts.extend(
@@ -2016,6 +2040,22 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    prompt = ""
+    native_provider = None
+    native_name = job.get("native_preparation_provider")
+    if native_name is not None:
+        if not isinstance(native_name, str) or not native_name.strip() or native_name != native_name.strip():
+            return False, "", "", "invalid native_preparation_provider"
+        if job.get("no_agent") or not job.get("script"):
+            return False, "", "", "protected native job requires an agent and script"
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+        try:
+            discover_plugins()
+            native_provider = get_plugin_manager().get_cron_native_preparation_provider(native_name)
+        except Exception as exc:
+            return False, "", "", f"native provider discovery failed: {exc}"
+        if native_provider is None or not callable(getattr(native_provider, "prepare", None)):
+            return False, "", "", "native preparation provider unavailable"
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -2126,16 +2166,17 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # at module top keeps no_agent ticks from paying for AIAgent / SessionDB
     # construction costs.
     # ---------------------------------------------------------------
-    from run_agent import AIAgent
+    from run_agent import AIAgent, build_nous_subscription_prompt
 
     # Initialize SQLite session store so cron job messages are persisted
     # and discoverable via session_search (same pattern as gateway/run.py).
     _session_db = None
-    try:
-        from hermes_state import SessionDB
-        _session_db = SessionDB()
-    except Exception as e:
-        logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
+    if native_provider is None:
+        try:
+            from hermes_state import SessionDB
+            _session_db = SessionDB()
+        except Exception as e:
+            logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
 
     # Wake-gate: if this job has a pre-check script, run it BEFORE building
     # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
@@ -2146,7 +2187,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     if script_path:
         prerun_script = _run_job_script(script_path)
         _ran_ok, _script_output = prerun_script
-        if _ran_ok and not _parse_wake_gate(_script_output):
+        if native_provider is not None and not _ran_ok:
+            return False, "", "", "protected native script failed"
+        if native_provider is None and _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
                 job_name, job_id,
@@ -2159,8 +2202,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
             return True, silent_doc, SILENT_MARKER, None
 
+    native_plan = None
     try:
-        prompt = _build_job_prompt(job, prerun_script=prerun_script)
+        if native_provider is not None:
+            native_plan = native_provider.prepare(job=job, script_output=prerun_script[1])
+        else:
+            prompt = _build_job_prompt(job, prerun_script=prerun_script)
     except CronPromptInjectionBlocked as block_exc:
         # Assembled prompt (user prompt + loaded skill content) tripped the
         # injection scanner. Refuse to run the agent this tick and surface
@@ -2184,7 +2231,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
         )
         return False, blocked_doc, "", str(block_exc)
-    if prompt is None:
+    except Exception as exc:
+        if native_provider is not None:
+            return False, "", "", f"native preparation declined: {type(exc).__name__}: {exc}"
+        raise
+    if native_provider is None and prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
     origin = _resolve_origin(job)
@@ -2396,6 +2447,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
             runtime = resolve_runtime_provider(**runtime_kwargs)
         except AuthError as auth_exc:
+            if native_provider is not None:
+                raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
             # Primary provider auth failed — try fallback chain before giving up.
             logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
             fb = _cfg.get("fallback_providers") or _cfg.get("fallback_model")
@@ -2478,7 +2531,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
-        if runtime_provider:
+        if native_provider is not None:
+            from agent.native_request import NativeAdmissionError
+            if not isinstance(runtime.get("api_key"), str) or not runtime["api_key"].strip():
+                raise NativeAdmissionError("cron_native_resolved_credential_missing")
+            if not isinstance(runtime.get("base_url"), str) or not runtime["base_url"].strip():
+                raise NativeAdmissionError("cron_native_resolved_base_url_missing")
+        elif runtime_provider:
             try:
                 from agent.credential_pool import load_pool
                 pool = load_pool(runtime_provider)
@@ -2492,6 +2551,32 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     )
             except Exception as e:
                 logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
+
+        preparation_context_length = None
+        if native_provider is not None:
+            from agent.native_request import NativeAdmissionError
+            from hermes_cli.config import get_custom_provider_context_length
+
+            if _cfg.get("mcp_servers"):
+                raise NativeAdmissionError("cron_native_mcp_discovery_unsupported")
+            if str(runtime.get("provider") or "").lower() == "lmstudio":
+                raise NativeAdmissionError("cron_native_lmstudio_load_unsupported")
+            configured_engine = (agent_cfg.get("context") or {}).get("engine", "compressor")
+            if configured_engine not in (None, "", "compressor"):
+                raise NativeAdmissionError("cron_native_context_engine_unsupported")
+            model_cfg = _cfg.get("model") or {}
+            explicit_length = model_cfg.get("context_length") if isinstance(model_cfg, dict) else None
+            try:
+                preparation_context_length = int(explicit_length)
+            except (TypeError, ValueError):
+                preparation_context_length = None
+            if not preparation_context_length or preparation_context_length <= 0:
+                preparation_context_length = get_custom_provider_context_length(
+                    model=model, base_url=runtime.get("base_url") or "",
+                    config=_cfg,
+                )
+            if not preparation_context_length:
+                raise NativeAdmissionError("cron_native_context_length_requires_explicit_config")
 
         # Initialize MCP servers so configured mcp_servers are available to
         # the agent's tool registry before AIAgent is constructed. Without
@@ -2514,7 +2599,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 job_id, _mcp_exc,
             )
 
-        agent = AIAgent(
+        agent_kwargs = dict(
             model=model,
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
@@ -2546,6 +2631,70 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        if native_provider is not None:
+            agent_kwargs["preparation_context_length"] = preparation_context_length
+
+        selected_native = None
+        native_turn = None
+        persist_user_message = _build_job_persist_user_message(job)
+        if native_provider is not None:
+            from cron.native import prepare_and_commit, profile_of
+            from agent.native_request import NativeAdmissionError, NativeRequestTurn
+            from copy import deepcopy
+
+            # Resolve capability-dependent guidance once with a real agent and
+            # the final cron constructor.  This is ordinary configuration,
+            # before any provisional SDK request is assembled.  The rendered
+            # block (including an empty result) is then fixed for this run.
+            configuration_agent = AIAgent(**agent_kwargs)
+            try:
+                configured_names = frozenset(configuration_agent.valid_tool_names)
+                configured_tools = deepcopy(configuration_agent.tools)
+                frozen_nous_prompt = build_nous_subscription_prompt(
+                    configuration_agent.valid_tool_names
+                )
+            finally:
+                configuration_agent.close()
+            if not isinstance(frozen_nous_prompt, str):
+                raise NativeAdmissionError("cron_native_nous_prompt_invalid")
+            agent_kwargs["frozen_nous_subscription_prompt"] = frozen_nous_prompt
+
+            def make_native_agent():
+                candidate = AIAgent(**agent_kwargs)
+                if (frozenset(candidate.valid_tool_names) != configured_names
+                        or candidate.tools != configured_tools):
+                    candidate.close()
+                    raise NativeAdmissionError("cron_native_tool_snapshot_drift")
+                return candidate
+
+            # Each provisional form gets the exact resolved cron constructor
+            # without a persistent session store.  The accepted prologue skips
+            # inbound persistence; it never reuses a mutated agent instance.
+            selected_native = prepare_and_commit(
+                job=job,
+                plan=native_plan,
+                build_prompt=lambda candidate_job, cached: _build_job_prompt(
+                    candidate_job, prerun_script=cached, preparation=True,
+                ),
+                make_agent=make_native_agent,
+                persist_user_message=persist_user_message,
+            )
+            prompt = selected_native.prompt
+            try:
+                from hermes_state import SessionDB
+                _session_db = SessionDB()
+            except Exception as exc:
+                raise NativeAdmissionError("cron_native_session_store_unavailable") from exc
+            agent_kwargs["session_db"] = _session_db
+            agent = make_native_agent()
+            if profile_of(agent) != selected_native.prepared.profile:
+                raise NativeAdmissionError("cron_native_dispatch_profile_drift")
+            native_turn = NativeRequestTurn(
+                "dispatch", prepared=selected_native.prepared.request,
+                delegate_factory=selected_native.selection.delegate_factory,
+            )
+        else:
+            agent = AIAgent(**agent_kwargs)
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -2574,12 +2723,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        persist_user_message = _build_job_persist_user_message(job)
         _cron_future = _cron_pool.submit(
             _cron_context.run,
             agent.run_conversation,
             prompt,
             persist_user_message=persist_user_message,
+            **({"native_turn": native_turn} if native_turn is not None else {}),
         )
         _inactivity_timeout = False
         try:
@@ -2640,6 +2789,15 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
                 f"— last activity: {_last_desc}"
             )
+
+        if native_provider is not None:
+            from cron.native import custody_from_execution, publish_run_custody
+            custody = custody_from_execution(job, selected_native, result)
+            response_text = str(getattr(result.response, "output_text", "") or "")
+            if not response_text.strip():
+                raise RuntimeError("protected native response was empty")
+            publish_run_custody(custody)
+            result = {"final_response": response_text, "completed": True, "failed": False}
 
         # Guard against non-dict returns from run_conversation under error conditions
         if not isinstance(result, dict):
@@ -2814,12 +2972,37 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    from cron.native import CronNativeArchiveInput, clear_run_custody, take_run_custody
+
+    clear_run_custody()
     try:
         success, output, final_response, error = run_job(job)
+        native_custody = take_run_custody()
 
         output_file = save_job_output(job["id"], output)
         if verbose:
             logger.info("Output saved to: %s", output_file)
+
+        if job.get("native_preparation_provider") is not None and success:
+            if native_custody is None or native_custody.job_id != str(job["id"]):
+                raise RuntimeError("protected native job missing run-local custody")
+            archive_path = Path(output_file)
+            archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            selected = native_custody.selected
+            execution = native_custody.execution
+            archive_input = CronNativeArchiveInput(
+                job_id=str(job["id"]), owner_binding=selected.prepared.owner_binding,
+                form_id=selected.prepared.form_id,
+                preparation_token=selected.prepared.preparation_token,
+                archive_path=archive_path, archive_sha256=archive_sha256,
+                attempt=execution.attempt,
+                outer_callback_count=execution.outer_callback_count,
+                outer_retry_count=execution.outer_retry_count,
+                fallback_activated=execution.fallback_activated,
+                compression_count=execution.compression_count,
+            )
+            if not selected.selection.archive_callback(archive_input):
+                raise RuntimeError("protected native archive callback refused custody")
 
         # Deliver the final response to the origin/target chat.
         # If the agent responded with [SILENT], skip delivery (but
@@ -2858,6 +3041,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         return True
 
     except Exception as e:
+        clear_run_custody()
         logger.error("Error processing job %s: %s", job['id'], e)
         mark_job_run(job["id"], False, str(e))
         return False

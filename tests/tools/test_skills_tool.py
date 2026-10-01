@@ -364,6 +364,55 @@ class TestSkillsList:
 
 
 class TestSkillView:
+    def test_read_only_refuses_effectful_requirements_without_registration(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = _make_skill(
+            tmp_path / "skills", "needs-setup",
+            frontmatter_extra=(
+                "prerequisites:\n  env_vars: [MISSING_PREPARATION_KEY]\n"
+                "required_credential_files: [token.json]\n"
+            ),
+        )
+        calls = []
+        monkeypatch.setattr(skills_tool_module, "_secret_capture_callback",
+                            lambda *a, **k: calls.append("secret"))
+        monkeypatch.setattr("tools.env_passthrough.register_env_passthrough",
+                            lambda *a, **k: calls.append("env"))
+        monkeypatch.setattr("tools.credential_files.register_credential_files",
+                            lambda *a, **k: calls.append("credential"))
+        with patch("tools.skills_tool.SKILLS_DIR", skill_dir.parent):
+            result = json.loads(skill_view("needs-setup", read_only=True, preprocess=False))
+        assert result["success"] is False
+        assert "read-only" in result["error"]
+        assert calls == []
+
+    def test_read_only_pure_skill_preserves_template_content(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = _make_skill(
+            tmp_path / "skills", "plain",
+            body="Run ${HERMES_SKILL_DIR}/scripts/check.sh",
+        )
+        with patch("tools.skills_tool.SKILLS_DIR", skill_dir.parent):
+            result = json.loads(skill_view("plain", read_only=True))
+        assert result["success"] is True
+        assert f"Run {skill_dir}/scripts/check.sh" in result["content"]
+
+    def test_read_only_plugin_skill_uses_registered_source_without_discovery(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        from hermes_cli import plugins
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = _make_skill(tmp_path / "plugins", "plugin-skill", body="Plugin body")
+        manager = plugins.PluginManager()
+        context = plugins.PluginContext(SimpleNamespace(name="fixture", key="fixture"), manager)
+        context.register_skill("plugin-skill", skill_dir / "SKILL.md")
+        monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+        monkeypatch.setattr(plugins, "discover_plugins",
+                            lambda *a, **k: pytest.fail("plugin discovery during read-only load"))
+        result = json.loads(skill_view("fixture:plugin-skill", read_only=True, preprocess=False))
+        assert result["success"] is True
+        assert "Plugin body" in result["content"]
+
     def test_view_existing_skill(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "my-skill")

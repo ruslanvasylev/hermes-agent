@@ -877,6 +877,7 @@ def _serve_plugin_skill(
     file_path: str | None = None,
     preprocess: bool = True,
     session_id: str | None = None,
+    read_only: bool = False,
 ) -> str:
     """Read a plugin-provided skill, apply guards, return JSON."""
     from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
@@ -955,6 +956,14 @@ def _serve_plugin_skill(
 
     rendered_content = content
     if preprocess:
+        if read_only:
+            from agent.skill_preprocessing import _INLINE_SHELL_RE, load_skills_config
+            if (load_skills_config().get("inline_shell", False)
+                    and _INLINE_SHELL_RE.search(content)):
+                return json.dumps({
+                    "success": False,
+                    "error": "Read-only skill load does not execute inline shell snippets.",
+                })
         try:
             from agent.skill_preprocessing import preprocess_skill_content
 
@@ -986,6 +995,7 @@ def skill_view(
     file_path: str = None,
     task_id: str = None,
     preprocess: bool = True,
+    read_only: bool = False,
 ) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
@@ -998,6 +1008,8 @@ def skill_view(
         preprocess: Apply configured SKILL.md template and inline shell rendering
             to main skill content. Internal slash/preload callers disable this
             because they render the skill message themselves.
+        read_only: Read skill content without discovery, credential capture,
+            environment registration, or effectful preprocessing.
 
     Returns:
         JSON string with skill content or error message
@@ -1039,14 +1051,16 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
-            discover_plugins()  # idempotent
+            if not read_only:
+                discover_plugins()  # idempotent
             pm = get_plugin_manager()
             plugin_skill_md = pm.find_plugin_skill(name)
 
             if plugin_skill_md is not None:
                 if not plugin_skill_md.exists():
                     # Stale registry entry — file deleted out of band
-                    pm.remove_plugin_skill(name)
+                    if not read_only:
+                        pm.remove_plugin_skill(name)
                     return json.dumps(
                         {
                             "success": False,
@@ -1066,6 +1080,7 @@ def skill_view(
                     file_path=file_path,
                     preprocess=preprocess,
                     session_id=task_id,
+                    read_only=read_only,
                 )
 
             # Plugin exists but this specific skill is missing?
@@ -1230,7 +1245,8 @@ def skill_view(
             skill_dir, skill_md = candidates[0]
 
         if not skill_md or not skill_md.exists():
-            available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
+            available = ([] if read_only else
+                         [s["name"] for s in _sort_skills(_find_all_skills())[:20]])
             return json.dumps(
                 {
                     "success": False,
@@ -1399,6 +1415,14 @@ def skill_view(
         required_env_vars = _get_required_environment_variables(
             frontmatter, legacy_env_vars
         )
+        if read_only and (required_env_vars or frontmatter.get("required_credential_files")):
+            return json.dumps({
+                "success": False,
+                "error": (
+                    f"Skill '{skill_name}' requires environment or credential registration "
+                    "that read-only loading cannot perform."
+                ),
+            }, ensure_ascii=False)
         backend = _get_terminal_backend_name()
         env_snapshot = load_env()
         missing_required_env_vars = [
@@ -1463,6 +1487,14 @@ def skill_view(
 
         rendered_content = content
         if preprocess:
+            if read_only:
+                from agent.skill_preprocessing import _INLINE_SHELL_RE, load_skills_config
+                if (load_skills_config().get("inline_shell", False)
+                        and _INLINE_SHELL_RE.search(content)):
+                    return json.dumps({
+                        "success": False,
+                        "error": "Read-only skill load does not execute inline shell snippets.",
+                    })
             try:
                 from agent.skill_preprocessing import preprocess_skill_content
 

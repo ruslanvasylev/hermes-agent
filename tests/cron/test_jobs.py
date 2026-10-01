@@ -238,6 +238,20 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 
 class TestJobCRUD:
+    def test_native_provider_selector_persists_and_clears(self, tmp_cron_dir):
+        job = create_job(prompt="Review source", schedule="30m", script="source.py",
+                         native_preparation_provider=" proof ")
+        assert get_job(job["id"])["native_preparation_provider"] == "proof"
+        updated = update_job(job["id"], {"native_preparation_provider": "other"})
+        assert updated["native_preparation_provider"] == "other"
+        assert get_job(job["id"])["native_preparation_provider"] == "other"
+        update_job(job["id"], {"native_preparation_provider": None})
+        assert get_job(job["id"])["native_preparation_provider"] is None
+        with pytest.raises(ValueError):
+            create_job(prompt="x", schedule="30m", native_preparation_provider=" ")
+        with pytest.raises(ValueError):
+            update_job(job["id"], {"native_preparation_provider": " "})
+
     def test_create_and_get(self, tmp_cron_dir):
         job = create_job(prompt="Check server status", schedule="30m")
         assert job["id"]

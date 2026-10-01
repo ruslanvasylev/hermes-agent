@@ -865,6 +865,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    native_preparation_provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -941,6 +942,14 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    if native_preparation_provider is not None and (
+        not isinstance(native_preparation_provider, str)
+        or not native_preparation_provider.strip()
+    ):
+        raise ValueError("native_preparation_provider must be a non-empty name")
+    normalized_native_provider = (
+        native_preparation_provider.strip() if native_preparation_provider is not None else None
+    )
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1013,6 +1022,8 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if normalized_native_provider is not None:
+        job["native_preparation_provider"] = normalized_native_provider
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1102,6 +1113,15 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            if "native_preparation_provider" in updates:
+                name = updates["native_preparation_provider"]
+                if name in (None, ""):
+                    updates["native_preparation_provider"] = None
+                elif not isinstance(name, str) or not name.strip():
+                    raise ValueError("native_preparation_provider must be a non-empty name")
+                else:
+                    updates["native_preparation_provider"] = name.strip()
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})

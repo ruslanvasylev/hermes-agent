@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import threading
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 from uuid import uuid4
 
 import httpx
@@ -20,6 +20,22 @@ _SUPPORTED_OPENAI_SDK_VERSION = "2.24.0"
 
 class NativeAdmissionError(RuntimeError):
     """A protected request failed closed; callers must not retry or fall back."""
+
+
+@dataclass(frozen=True)
+class NativeTurnContext:
+    """Opt-in policy for the once-per-turn prologue, never stored on an agent.
+
+    A caller passes a fresh context directly to ``build_turn_context`` for
+    each provisional preparation or guarded dispatch.  It carries no provider
+    authority and cannot turn a captured request into an admitted attempt.
+    """
+
+    phase: Literal["prepare", "dispatch"]
+
+    def __post_init__(self) -> None:
+        if self.phase not in ("prepare", "dispatch"):
+            raise NativeAdmissionError("native_turn_phase_invalid")
 
 
 @dataclass(frozen=True)

@@ -34,6 +34,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
+from agent.native_request import NativeAdmissionError, NativeTurnContext
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,7 @@ def build_turn_context(
     set_session_context,
     set_current_write_origin,
     ra,
+    native_context: NativeTurnContext | None = None,
 ) -> TurnContext:
     """Run the once-per-turn setup and return the loop's input context.
 
@@ -140,6 +142,34 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
+    if native_context is not None:
+        if not isinstance(native_context, NativeTurnContext):
+            raise NativeAdmissionError("native_turn_context_invalid")
+        # These inputs can change the request or reach another service during
+        # provisional preparation.  Until they have a stable, side-effect-free
+        # snapshot interface, neither phase can claim request parity with them.
+        if getattr(agent, "_fallback_activated", False):
+            raise NativeAdmissionError("native_turn_active_fallback")
+        primary = getattr(agent, "_primary_runtime", None)
+        if isinstance(primary, dict) and any(
+            key in primary and getattr(agent, key, None) != primary[key]
+            for key in ("model", "provider", "base_url", "api_mode")
+        ):
+            raise NativeAdmissionError("native_turn_runtime_drift")
+        if getattr(agent, "_memory_manager", None) is not None or (
+            getattr(agent, "_memory_store", None) is not None
+            and getattr(agent, "_memory_nudge_interval", 0) > 0
+            and "memory" in getattr(agent, "valid_tool_names", ())
+        ):
+            raise NativeAdmissionError("native_turn_memory_context_unsupported")
+        from hermes_cli.plugins import has_hook
+        if has_hook("pre_llm_call"):
+            raise NativeAdmissionError("native_turn_pre_llm_context_unsupported")
+        if not getattr(agent, "_skip_mcp_refresh", False):
+            from tools.mcp_tool import has_registered_mcp_tools
+            if has_registered_mcp_tools():
+                raise NativeAdmissionError("native_turn_mcp_refresh_unsupported")
+
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
@@ -171,7 +201,8 @@ def build_turn_context(
     set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
 
     # Restore the primary runtime if the previous turn activated fallback.
-    agent._restore_primary_runtime()
+    if native_context is None:
+        agent._restore_primary_runtime()
 
     # Between-turns MCP refresh: an MCP server that finished connecting since
     # the previous turn (slow HTTP/OAuth servers routinely take 2-6s on a cold
@@ -229,7 +260,7 @@ def build_turn_context(
     agent._vision_supported = True
 
     # Pre-turn connection health check: clean up dead TCP connections.
-    if agent.api_mode != "anthropic_messages":
+    if native_context is None and agent.api_mode != "anthropic_messages":
         try:
             if agent._cleanup_dead_connections():
                 agent._emit_status(
@@ -240,7 +271,7 @@ def build_turn_context(
         except Exception:
             pass
     # Replay compression warning through status_callback for gateway platforms.
-    if agent._compression_warning:
+    if native_context is None and agent._compression_warning:
         agent._replay_compression_warning()
         agent._compression_warning = None  # send once
 
@@ -322,17 +353,19 @@ def build_turn_context(
     # Create the DB session row now that _cached_system_prompt is populated, so
     # the persisted snapshot is written non-NULL on the first turn (Issue
     # #45499). Idempotent: _ensure_db_session() no-ops once the row exists.
-    agent._ensure_db_session()
+    if native_context is None or native_context.phase == "dispatch":
+        agent._ensure_db_session()
 
     # Crash-resilience: persist the inbound user turn as soon as the session row exists.
-    try:
-        agent._persist_session(messages, conversation_history)
-    except Exception:
-        logger.warning(
-            "Early turn-start session persistence failed for session=%s",
-            agent.session_id or "none",
-            exc_info=True,
-        )
+    if native_context is None or native_context.phase == "dispatch":
+        try:
+            agent._persist_session(messages, conversation_history)
+        except Exception:
+            logger.warning(
+                "Early turn-start session persistence failed for session=%s",
+                agent.session_id or "none",
+                exc_info=True,
+            )
 
     # ── Preflight context compression ──
     # Gate the (expensive) full token estimate behind a cheap pre-check.
@@ -357,7 +390,7 @@ def build_turn_context(
         )
         _preflight_deferred = _defer_preflight(_preflight_tokens)
 
-        if not _preflight_deferred:
+        if not _preflight_deferred and native_context is None:
             _last = _compressor.last_prompt_tokens
             # Do NOT overwrite the -1 sentinel (#36718).
             if _last >= 0 and _preflight_tokens > _last:
@@ -368,6 +401,11 @@ def build_turn_context(
             "get_active_compression_failure_cooldown",
             lambda: None,
         )()
+
+        if (native_context is not None and not _preflight_deferred
+                and not _compression_cooldown
+                and _compressor.should_compress(_preflight_tokens)):
+            raise NativeAdmissionError("native_turn_preflight_compression_required")
 
         if _preflight_deferred:
             logger.info(
@@ -384,7 +422,7 @@ def build_turn_context(
                 int(_compression_cooldown.get("remaining_seconds", 0.0)),
                 agent.session_id or "none",
             )
-        elif _compressor.should_compress(_preflight_tokens):
+        elif native_context is None and _compressor.should_compress(_preflight_tokens):
             logger.info(
                 "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
                 f"{_preflight_tokens:,}",

@@ -173,6 +173,8 @@ def apply_api_request_middleware(
 def run_llm_execution_middleware(
     request: Dict[str, Any],
     next_call: Callable[[Dict[str, Any]], Any],
+    *,
+    require_single_execution: bool = False,
     **context: Any,
 ) -> Any:
     """Run provider execution through registered LLM execution middleware."""
@@ -183,6 +185,7 @@ def run_llm_execution_middleware(
         LLM_EXECUTION_MIDDLEWARE,
         callbacks,
         next_call,
+        require_single_execution=require_single_execution,
         request=request,
         original_request=context.pop("original_request", request),
         **context,
@@ -213,10 +216,14 @@ def run_tool_execution_middleware(
 def run_api_execution_middleware(
     request: Dict[str, Any],
     next_call: Callable[[Dict[str, Any]], Any],
+    *,
+    require_single_execution: bool = False,
     **context: Any,
 ) -> Any:
     """Compatibility wrapper for older ``api_execution`` naming."""
-    return run_llm_execution_middleware(request, next_call, **context)
+    return run_llm_execution_middleware(
+        request, next_call, require_single_execution=require_single_execution, **context
+    )
 
 
 def _invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
@@ -241,6 +248,8 @@ def _run_execution_chain(
     kind: str,
     callbacks: List[Callable],
     terminal_call: Callable[[Any], Any],
+    *,
+    require_single_execution: bool = False,
     **kwargs: Any,
 ) -> Any:
     payload_key = "request" if "request" in kwargs else "args"
@@ -258,35 +267,55 @@ def _run_execution_chain(
         next_called = False
         next_succeeded = False
         next_result: Any = None
+        violation: Optional[BaseException] = None
 
         def next_call(next_payload: Any = None) -> Any:
-            nonlocal next_called, next_succeeded, next_result
+            nonlocal next_called, next_succeeded, next_result, violation
             # ``next_call`` is single-use per middleware frame. Calling it more
             # than once would re-run the downstream provider/tool, so a second
             # invocation is a contract violation rather than a retry. Surface it
             # instead of silently executing the terminal call twice.
             if next_called:
-                raise RuntimeError(
+                error = RuntimeError(
                     f"Middleware '{kind}' callback "
                     f"{getattr(callback, '__name__', repr(callback))} called "
                     "next_call() more than once; downstream execution is single-use"
                 )
+                if require_single_execution and violation is None:
+                    violation = error
+                raise error
             next_called = True
             try:
                 next_result = call_at(index + 1, payload if next_payload is None else next_payload)
                 next_succeeded = True
                 return next_result
             except Exception as exc:
+                if require_single_execution and violation is None:
+                    violation = exc
                 raise _DownstreamExecutionError(exc) from exc
 
         call_kwargs = middleware_payload(**kwargs)
         call_kwargs[payload_key] = payload
         call_kwargs["next_call"] = next_call
         try:
-            return callback(**call_kwargs)
+            result = callback(**call_kwargs)
+            if require_single_execution:
+                if violation is not None:
+                    raise violation
+                if not next_succeeded:
+                    raise RuntimeError(
+                        f"Middleware '{kind}' callback "
+                        f"{getattr(callback, '__name__', repr(callback))} must call "
+                        "next_call() exactly once"
+                    )
+            return result
         except _DownstreamExecutionError as exc:
             raise exc.original
         except Exception as exc:
+            if require_single_execution:
+                if violation is not None:
+                    raise violation
+                raise
             logger.warning(
                 "Middleware '%s' callback %s raised: %s",
                 kind,

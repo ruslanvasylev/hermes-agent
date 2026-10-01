@@ -12,7 +12,10 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from cron.native import CronNativePlan, CronNativeSelection, CronNativeVariant
+from cron.native import (
+    CronNativePlan, CronNativeSelection, CronNativeVariant, prepare_and_commit,
+    profile_of,
+)
 
 
 def _terminal(request, *, model="test-model"):
@@ -242,7 +245,6 @@ def test_protected_script_failure_never_prepares_or_dispatches(tmp_path, monkeyp
 
 
 def test_invalid_native_forms_fail_before_agent_or_commit():
-    from cron.native import CronNativePlan, prepare_and_commit
     from agent.native_request import NativeAdmissionError
 
     calls = []
@@ -256,6 +258,67 @@ def test_invalid_native_forms_fail_before_agent_or_commit():
             persist_user_message="source",
         )
     assert calls == []
+
+
+def _real_native_agent(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "agent:\n  max_turns: 1\n"
+        "model:\n  context_length: 131072\n"
+        "compression:\n  enabled: false\n"
+        "tools:\n  tool_search:\n    enabled: off\n"
+    )
+    (tmp_path / ".env").write_text("")
+    from run_agent import AIAgent
+
+    return AIAgent(
+        model="test-model", provider="openai-codex", api_mode="codex_responses",
+        api_key="fixture-only", base_url="https://example.invalid/v1",
+        max_tokens=8192, preparation_context_length=131072,
+        quiet_mode=True, skip_memory=True,
+    )
+
+
+def test_profile_observes_actual_compressor_reservation_separately(tmp_path, monkeypatch):
+    agent = _real_native_agent(tmp_path, monkeypatch)
+    try:
+        agent.context_compressor.max_tokens = 4096
+        profile = profile_of(agent)
+        assert profile.max_tokens == 8192
+        assert profile.compressor_max_tokens == 4096
+        agent.context_compressor.max_tokens = None
+        assert profile_of(agent).compressor_max_tokens is None
+    finally:
+        agent.close()
+
+
+def test_compressor_reservation_drift_during_real_capture_refuses_commit(tmp_path, monkeypatch):
+    from agent.native_request import CaptureTransport, NativeAdmissionError
+
+    agent = _real_native_agent(tmp_path, monkeypatch)
+    observed = {"capture": 0, "commit": 0}
+    real_capture = CaptureTransport.handle_request
+
+    def mutate_during_capture(transport, request):
+        observed["capture"] += 1
+        agent.context_compressor.max_tokens = 4096
+        return real_capture(transport, request)
+
+    monkeypatch.setattr(CaptureTransport, "handle_request", mutate_during_capture)
+
+    def commit(records):
+        observed["commit"] += 1
+        pytest.fail("profile drift reached trusted commit")
+
+    with pytest.raises(NativeAdmissionError, match="cron_native_profile_drift"):
+        prepare_and_commit(
+            job=_job(),
+            plan=CronNativePlan((CronNativeVariant("one", "source", "owner"),), commit),
+            build_prompt=lambda job, cached: "Review the source",
+            make_agent=lambda: agent,
+            persist_user_message="source",
+        )
+    assert observed == {"capture": 1, "commit": 0}
 
 
 def test_cold_custom_endpoint_constructor_refuses_before_metadata_probe(tmp_path, monkeypatch):

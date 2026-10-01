@@ -35,6 +35,7 @@ class CronNativeProfile:
     context_length: int
     threshold_tokens: int
     max_tokens: int
+    compressor_max_tokens: int | None
 
 
 @dataclass(frozen=True)
@@ -121,6 +122,7 @@ def profile_of(agent: Any) -> CronNativeProfile:
         context_length=int(getattr(compressor, "context_length", 0) or 0),
         threshold_tokens=int(getattr(compressor, "threshold_tokens", 0) or 0),
         max_tokens=int(getattr(agent, "max_tokens", 0) or 0),
+        compressor_max_tokens=getattr(compressor, "max_tokens", None),
     )
 
 
@@ -161,6 +163,8 @@ def prepare_and_commit(
             )
             if not isinstance(result, NativePreparationResult):
                 raise NativeAdmissionError("cron_native_capture_missing")
+            if profile_of(agent) != current_profile:
+                raise NativeAdmissionError("cron_native_profile_drift")
             prepared.append(CronNativePrepared(
                 form_id=variant.form_id, preparation_token=uuid4().hex,
                 owner_binding=variant.owner_binding, request=result.prepared,

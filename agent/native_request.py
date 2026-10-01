@@ -42,6 +42,7 @@ class NativeTurnContext:
 class PreparedRequest:
     method: str
     url: str
+    body: bytes = field(repr=False)
     body_sha256: str
     body_bytes: int
 
@@ -66,6 +67,7 @@ def _prepared(request: httpx.Request) -> PreparedRequest:
     return PreparedRequest(
         method=request.method,
         url=str(request.url),
+        body=body,
         body_sha256=hashlib.sha256(body).hexdigest(),
         body_bytes=len(body),
     )

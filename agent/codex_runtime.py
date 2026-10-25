@@ -670,6 +670,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         agent._fire_reasoning_delta(text)
 
     def _on_event(event: Any) -> None:
+        from agent.api_run_budget import active_run_budget
+        _budget = active_run_budget(agent)
+        if _budget is not None and _budget.remaining_seconds() == 0:
+            _budget.expire()
+            from agent.api_run_budget import ApiRunBudgetExceeded
+            raise ApiRunBudgetExceeded("max_run_seconds")
         # TTFB watchdog and activity touch — runs once per SSE event.
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
@@ -682,6 +688,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
         stream_kwargs = dict(api_kwargs)
+        from agent.api_run_budget import active_run_budget
+        _budget = active_run_budget(agent)
+        if _budget is not None:
+            stream_kwargs["timeout"] = _budget.cap_timeout(stream_kwargs.get("timeout"))
         stream_kwargs["stream"] = True
 
         try:

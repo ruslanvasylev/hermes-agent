@@ -865,6 +865,8 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    api_max_attempts: Optional[int] = None,
+    max_run_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -905,6 +907,10 @@ def create_job(
                 With ``no_agent=True``, ``workdir`` is still applied as the
                 script's cwd so relative paths inside the script behave
                 predictably.
+        api_max_attempts: Optional run-wide application execution dispatch ceiling;
+                does not count internal transport retries or auxiliary calls.
+        max_run_seconds: Optional model-run monotonic elapsed cancellation limit,
+                independent of inactivity and excluding the pre-run script.
         no_agent: When True, skip the agent entirely — run ``script`` on schedule
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
@@ -1008,9 +1014,14 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
-    # Only persist attach_to_session when explicitly set, so existing jobs and
-    # the common case stay byte-identical (absent key => fall back to the
-    # global cron.mirror_delivery config, default off).
+    # Optional run controls do not change existing jobs or global retry policy.
+    from agent.api_run_budget import validate_run_limits
+    validate_run_limits(api_max_attempts, max_run_seconds)
+    if api_max_attempts is not None:
+        job["api_max_attempts"] = api_max_attempts
+    if max_run_seconds is not None:
+        job["max_run_seconds"] = max_run_seconds
+    # Absent attach_to_session keeps the global mirror-delivery default.
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
 
@@ -1088,6 +1099,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}"
         )
 
+    from agent.api_run_budget import validate_run_limits
+    validate_run_limits(updates.get("api_max_attempts"), updates.get("max_run_seconds"))
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):

@@ -1081,6 +1081,14 @@ def run_conversation(
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
 
+                from agent.api_run_budget import active_run_budget
+                _run_budget = active_run_budget(agent)
+                if _run_budget is not None:
+                    _run_budget.claim_attempt()
+                    _remaining = _run_budget.remaining_seconds()
+                    if _remaining is not None and agent.api_mode != "bedrock_converse":
+                        api_kwargs["timeout"] = _run_budget.cap_timeout(api_kwargs.get("timeout"))
+
                 try:
                     from hermes_cli.plugins import (
                         has_hook,
@@ -1132,6 +1140,7 @@ def run_conversation(
                             request_char_count=total_chars,
                             max_tokens=agent.max_tokens,
                             started_at=api_start_time,
+                            api_run_budget=_run_budget.metadata() if _run_budget else None,
                             middleware_trace=list(_llm_middleware_trace),
                             request=_request_payload,
                         )
@@ -2401,6 +2410,26 @@ def run_conversation(
                     retryable=classified.retryable,
                     reason=classified.reason.value,
                 )
+
+                from agent.api_run_budget import active_run_budget
+                _run_budget = active_run_budget(agent)
+                if _run_budget is not None:
+                    logger.warning(
+                        "API run attempt failed session_id=%s task_id=%s turn_id=%s "
+                        "api_request_id=%s application_attempt=%s api_max_attempts=%s "
+                        "error_type=%s run_elapsed_seconds=%.3f",
+                        agent.session_id or "", effective_task_id, turn_id, api_request_id,
+                        _run_budget.attempts, _run_budget.max_attempts,
+                        type(api_error).__name__, _run_budget.metadata()["run_elapsed_seconds"],
+                    )
+                if (
+                    _run_budget is not None
+                    and _run_budget.max_attempts is not None
+                    and _run_budget.attempts >= _run_budget.max_attempts
+                ):
+                    _run_budget.exhaust_attempts()
+                    agent._persist_session(messages, conversation_history)
+                    return {"final_response": "", "messages": messages, "completed": False, "failed": True}
 
                 if (
                     classified.reason == FailoverReason.billing
@@ -3993,6 +4022,7 @@ def run_conversation(
                         api_mode=agent.api_mode,
                         api_call_count=api_call_count,
                         api_duration=api_duration,
+                        api_run_budget=_run_budget.metadata() if _run_budget else None,
                         started_at=api_start_time,
                         ended_at=_api_ended_at,
                         finish_reason=finish_reason,

@@ -1924,9 +1924,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     "Cloud reasoning stream — read timeout raised to %.0fs to "
                     "match stale-stream detector", _stream_read_timeout,
                 )
+        from agent.api_run_budget import active_run_budget
+        _budget = active_run_budget(agent)
+        if _budget is not None:
+            _base_timeout = _budget.cap_timeout(_base_timeout)
+            _stream_read_timeout = _budget.cap_timeout(_stream_read_timeout)
+
         # Cap connect/pool at 60s even when provider timeout is higher.
         # connect/pool cover TCP handshake, not model inference.
         _conn_cap = min(_base_timeout, 60.0) if _provider_timeout_cfg is not None else 30.0
+        if _budget is not None:
+            _conn_cap = _budget.cap_timeout(_conn_cap)
         stream_kwargs = {
             **api_kwargs,
             "stream": True,
@@ -1990,6 +1998,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         reasoning_parts: list = []
         usage_obj = None
         for chunk in stream:
+            if _budget is not None and _budget.remaining_seconds() == 0:
+                _budget.expire()
+                from agent.api_run_budget import ApiRunBudgetExceeded
+                raise ApiRunBudgetExceeded("max_run_seconds")
             last_chunk_time["t"] = time.time()
             agent._touch_activity("receiving stream response")
 

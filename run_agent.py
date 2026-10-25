@@ -451,8 +451,13 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        api_max_attempts: Optional[int] = None,
+        max_run_seconds: Optional[float] = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
+        from agent.api_run_budget import validate_run_limits
+        self._api_run_budget_limits = validate_run_limits(api_max_attempts, max_run_seconds)
+        self._api_run_budget = None
         from agent.agent_init import init_agent
         init_agent(
             self,
@@ -1153,9 +1158,10 @@ class AIAgent:
         timeout the AIAgent.__init__ path configured.
         """
         cfg = get_provider_request_timeout(self.provider, self.model)
-        if cfg is not None:
-            return cfg
-        return env_float("HERMES_API_TIMEOUT", 1800.0)
+        timeout = cfg if cfg is not None else env_float("HERMES_API_TIMEOUT", 1800.0)
+        from agent.api_run_budget import active_run_budget
+        budget = active_run_budget(self)
+        return budget.cap_timeout(timeout) if budget else timeout
 
     def _resolved_api_call_stale_timeout_base(self) -> tuple[float, bool]:
         """Resolve the base non-stream stale timeout and whether it is implicit.
@@ -2430,6 +2436,7 @@ class AIAgent:
                 status_code=status_code,
                 retry_count=retry_count,
                 max_retries=max_retries,
+                api_run_budget=(self._api_run_budget.metadata() if getattr(self, "_api_run_budget", None) is not None else None),
                 retryable=retryable,
                 reason=reason,
                 error={
@@ -5549,8 +5556,9 @@ class AIAgent:
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.conversation_loop import run_conversation
-        return run_conversation(
-            self,
+        from agent.api_run_budget import run_with_budget
+        return run_with_budget(
+            self, run_conversation, self,
             user_message,
             system_message,
             conversation_history,

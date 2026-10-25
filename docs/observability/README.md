@@ -314,3 +314,46 @@ The bundled NeMo Relay plugin maps the same generic observer contract to NeMo
 Relay scopes, LLM spans, tool spans, marks, ATOF streams, and ATIF exports.
 NeMo Relay-specific configuration and examples live in
 [`plugins/observability/nemo_relay/README.md`](../../plugins/observability/nemo_relay/README.md).
+
+### Optional run budgets
+
+Cron's native Python job API accepts `api_max_attempts` and `max_run_seconds`;
+`AIAgent` accepts the same optional constructor arguments. For example:
+
+```python
+update_job(job_id, {"api_max_attempts": 3, "max_run_seconds": 180})
+```
+
+Absent or `None` limits preserve existing jobs and the configured
+`agent.api_max_retries`. `api_max_attempts` counts application execution
+dispatches across the entire conversation, including retries and fallbacks.
+Recovery cannot reset it. It does **not** count SDK/transport wire attempts,
+including a provider's internal stream retries or auxiliary model calls.
+
+`max_run_seconds` uses monotonic elapsed time from conversation startup, after
+any cron pre-run script. It requests native cooperative cancellation regardless
+of stream progress, tool activity, or retry backoff. OpenAI-compatible and Codex
+request timeouts are capped by remaining time. Cron independently detects the
+deadline and requests cancellation. Python tool threads and remote requests
+cannot be forcibly terminated by this mechanism; cancellation does not prove remote work stopped.
+A timed-out conversation retains its resources, same-job overlap guard and
+sequential-workdir pool slot until its worker actually exits. Cleanup, including
+ContextVar restoration, then runs on the original owning thread. An
+uncooperative tool can therefore retain the slot beyond the cancellation
+deadline; elapsed cancellation is not a hard completion guarantee. The existing
+pre-run script timeout remains separate.
+
+Request observer events carry an additive `api_run_budget` metadata object with
+`application_attempts`, the configured limits, `run_elapsed_seconds`, and an
+optional `budget_exhausted_reason`. Existing `api_request_id`, `retry_count` and
+`api_duration` retain their native semantics: IDs can span retries, duration can
+include retry/backoff time, and neither counts distinct wire attempts. No prompt,
+response or credentials are added by budget metadata. An exhausted run returns
+`failed=True`, `completed=False`, `error_type="ApiRunBudgetExceeded"`, and an
+`error_code` identifying the exhausted limit. The generic event callback receives
+`api_run_budget_exhausted`; cron logs job/session correlation and reports failure.
+Limited runs also log each failed application attempt with session/task/turn/API
+identity, error class and cumulative run elapsed time, without request content.
+Script-gated/no-agent ticks continue to skip model construction.
+`codex_app_server` rejects a configured `api_max_attempts` before delegation,
+because that transport bypasses Hermes application dispatch accounting.

@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -2194,6 +2195,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     logger.info("Prompt: %s", prompt[:100])
 
     agent = None
+    _cron_future = None
 
     # Mark this as a cron session so the approval system can apply cron_mode.
     # This env var is process-wide and persists for the lifetime of the
@@ -2545,8 +2547,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
+            api_max_attempts=job.get("api_max_attempts"),
+            max_run_seconds=job.get("max_run_seconds"),
         )
         
+        if job.get("api_max_attempts") is not None or job.get("max_run_seconds") is not None:
+            logger.info(
+                "Cron model run started job_id=%s session_id=%s api_max_attempts=%s max_run_seconds=%s",
+                job_id, _cron_session_id, job.get("api_max_attempts"), job.get("max_run_seconds"),
+            )
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
@@ -2582,18 +2592,27 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             persist_user_message=persist_user_message,
         )
         _inactivity_timeout = False
+        _absolute_seconds = job.get("max_run_seconds")
+        _absolute_deadline = time.monotonic() + _absolute_seconds if _absolute_seconds is not None else None
+        _absolute_timeout = False
         try:
-            if _cron_inactivity_limit is None:
+            if _cron_inactivity_limit is None and _absolute_deadline is None:
                 # Unlimited — just wait for the result.
                 result = _cron_future.result()
             else:
                 result = None
                 while True:
+                    _wait = _POLL_INTERVAL
+                    if _absolute_deadline is not None:
+                        _wait = min(_wait, max(0.0, _absolute_deadline - time.monotonic()))
                     done, _ = concurrent.futures.wait(
-                        {_cron_future}, timeout=_POLL_INTERVAL,
+                        {_cron_future}, timeout=_wait,
                     )
                     if done:
                         result = _cron_future.result()
+                        break
+                    if _absolute_deadline is not None and time.monotonic() >= _absolute_deadline:
+                        _absolute_timeout = True
                         break
                     # Agent still running — check inactivity.
                     _idle_secs = 0.0
@@ -2603,7 +2622,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                             _idle_secs = _act.get("seconds_since_activity", 0.0)
                         except Exception:
                             pass
-                    if _idle_secs >= _cron_inactivity_limit:
+                    if _cron_inactivity_limit is not None and _idle_secs >= _cron_inactivity_limit:
                         _inactivity_timeout = True
                         break
         except Exception:
@@ -2611,6 +2630,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             raise
         finally:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
+
+        if _absolute_timeout:
+            agent.interrupt("Cron job elapsed budget exhausted")
+            logger.warning("Cron run budget exhausted job_id=%s session_id=%s reason=max_run_seconds max_run_seconds=%s cancellation=cooperative", job_id, _cron_session_id, _absolute_seconds)
+            raise TimeoutError("Cron run budget exhausted: max_run_seconds (cooperative cancellation requested)")
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.
@@ -2662,6 +2686,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             and turn_exit_reason.startswith("max_iterations_reached(")
             and bool(final_response_text)
         )
+        if result.get("api_run_budget"):
+            logger.warning("Cron run budget outcome job_id=%s session_id=%s error_type=%s budget=%s", job_id, _cron_session_id, result.get("error_type"), result["api_run_budget"])
         if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
             _err_text = (
                 result.get("error")
@@ -2746,6 +2772,17 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         return False, output, "", error_msg
 
     finally:
+        # Cancellation is cooperative. Keep this owning pool thread (and its
+        # same-job/sequential-workdir exclusion) until the conversation actually
+        # exits. Restoring the environment or closing its DB/client earlier
+        # races live tools. ContextVar cleanup below stays on this owner thread.
+        if _cron_future is not None and not _cron_future.done():
+            logger.warning(
+                "Cron cancellation pending job_id=%s session_id=%s; "
+                "retaining resources and pool exclusion until worker exit",
+                job_id, _cron_session_id,
+            )
+            concurrent.futures.wait({_cron_future})
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
         # only ever mutate it when the job has a workdir; see the setup block
         # at the top of run_job for the serialization guarantee.

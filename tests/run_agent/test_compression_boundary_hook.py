@@ -94,7 +94,7 @@ class TestCompressionBoundaryHook:
                 f"Expected old_session_id={original_sid!r}, got {call.kwargs!r}"
 
     def test_no_hook_when_no_session_db(self):
-        """Without session_db, session_id does not rotate and the hook is not fired."""
+        """Rotation mode without a DB cannot rotate or emit a rotation boundary."""
         from run_agent import AIAgent
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
             agent = AIAgent(
@@ -107,6 +107,9 @@ class TestCompressionBoundaryHook:
                 skip_context_files=True,
                 skip_memory=True,
             )
+        # This is the rotation fallback control. The normal configuration now
+        # defaults to in-place compaction, which emits a same-ID boundary.
+        agent.compression_in_place = False
 
         compressor = MagicMock()
         compressor.compress.return_value = [{"role": "user", "content": "x"}]
@@ -119,7 +122,7 @@ class TestCompressionBoundaryHook:
         original_sid = agent.session_id
         agent._compress_context([{"role": "user", "content": "m"}], "sys", approx_tokens=100)
 
-        # No DB => no rotation => no compression-boundary hook
+        # Rotation fallback + no DB => no rotation or boundary hook
         assert agent.session_id == original_sid
         comp_calls = [
             c for c in compressor.on_session_start.call_args_list
@@ -128,6 +131,32 @@ class TestCompressionBoundaryHook:
         assert not comp_calls, (
             f"No compression hook should fire without session_db rotation, "
             f"got {comp_calls!r}"
+        )
+
+    def test_in_place_without_db_notifies_same_session_boundary(self):
+        agent = self._make_agent(None)
+        agent.compression_in_place = True
+        compressor = MagicMock()
+        compressor.compress.return_value = [{"role": "user", "content": "summary"}]
+        compressor.compression_count = 1
+        compressor.last_prompt_tokens = 0
+        compressor.last_completion_tokens = 0
+        compressor._last_summary_error = None
+        compressor._last_compress_aborted = False
+        agent.context_compressor = compressor
+        original_sid = agent.session_id
+
+        compressed, _ = agent._compress_context(
+            [{"role": "user", "content": "original"}], "sys", approx_tokens=100,
+        )
+
+        assert compressed == [{"role": "user", "content": "summary"}]
+        assert agent.session_id == original_sid
+        # No durable DB rewrite occurred, but the live context was compacted.
+        assert agent._last_compaction_in_place is False
+        compressor.on_session_start.assert_called_once_with(
+            original_sid, boundary_reason="compression", old_session_id=original_sid,
+            platform="cli", conversation_id=None,
         )
 
     def test_hook_failure_does_not_break_compression(self):

@@ -178,6 +178,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # a network bug and surfaced to the caller. (PR #6600 — cascading interrupt
     # hang.)
     _request_cancelled = {"value": False}
+    _codex_idle_error: Optional[TimeoutError] = None
 
     def _set_request_client(client):
         with request_client_lock:
@@ -331,6 +332,16 @@ def interruptible_api_call(agent, api_kwargs: dict):
         _codex_idle_timeout_default = 60.0
     else:
         _codex_idle_timeout_default = 12.0
+
+    # High-effort reasoning can legitimately be silent between SSE items even
+    # for small inputs (observed 17s gaps in a successful xhigh response). Input
+    # size alone must not select the short reconnect window for that workload.
+    # Keep larger context windows and apply the explicit override/disable below.
+    _reasoning = api_kwargs.get("reasoning")
+    if (_codex_watchdog_enabled and _openai_codex_backend
+            and isinstance(_reasoning, dict)
+            and _reasoning.get("effort") in {"high", "xhigh"}):
+        _codex_idle_timeout_default = max(_codex_idle_timeout_default, 60.0)
 
     # No-byte TTFB cutoff. The OpenAI SDK's own streaming read timeout is far
     # longer (openai 2.x DEFAULT_TIMEOUT.read = 600s), so a tight 12s default
@@ -507,8 +518,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"codex stream killed after {int(_event_stale_elapsed)}s with no SSE events"
             )
             t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
-                result["error"] = TimeoutError(
+            if result["response"] is None:
+                # Aborting the socket can make the worker report ReadError /
+                # Broken pipe before join returns. That is the consequence of
+                # this watchdog, not a replacement for its timeout cause. Keep
+                # the decision outside the worker-mutated result dictionary.
+                _codex_idle_error = TimeoutError(
                     f"Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
                     f"after first byte (threshold: {int(_codex_idle_timeout)}s)"
                 )
@@ -591,6 +606,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
             except Exception:
                 pass
             raise InterruptedError("Agent interrupted during API call")
+    if _codex_idle_error is not None:
+        raise _codex_idle_error from result["error"]
     if result["error"] is not None:
         raise result["error"]
     return result["response"]

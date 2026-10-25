@@ -544,3 +544,104 @@ def test_large_codex_request_strict_ttfb_env_still_reconnects(tmp_path, monkeypa
         assert "codex_ttfb_kill" in closes
     finally:
         stop["flag"] = True
+
+
+def _run_clocked_event_silence(tmp_path, monkeypatch, *, gap, reasoning=None,
+                               context_tokens=100, override=None):
+    """Exercise real request worker/abort paths without sleeping through idle windows."""
+    import threading
+    import httpx
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.delenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", raising=False)
+    if override is not None:
+        monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", str(override))
+    monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", lambda *a, **k: 300.0)
+    monkeypatch.setattr(h, "estimate_request_context_tokens", lambda _: context_tokens)
+    clock = [100.0]
+    monkeypatch.setattr(h, "time", SimpleNamespace(time=lambda: clock[0]))
+    ready, release, aborted = threading.Event(), threading.Event(), threading.Event()
+    closes = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+
+    def abort(client, reason=None):
+        closes.append(reason)
+        aborted.set()
+        release.set()
+
+    monkeypatch.setattr(agent, "_abort_request_openai_client", abort)
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda c, reason=None: closes.append(reason))
+    sentinel = SimpleNamespace(ok=True)
+
+    def stream(api_kwargs, client=None, on_first_delta=None):
+        agent._codex_stream_last_event_ts = clock[0]
+        ready.set()
+        assert release.wait(3), "poller did not finish the deterministic stream"
+        if aborted.is_set():
+            raise httpx.ReadError("synthetic broken pipe induced by watchdog abort")
+        return sentinel
+
+    monkeypatch.setattr(agent, "_run_codex_stream", stream)
+
+    class ClockedPollThread(threading.Thread):
+        polls = 0
+
+        def join(self, timeout=None):
+            self.polls += 1
+            assert ready.wait(3), "request worker did not open the stream"
+            if self.polls == 1:
+                clock[0] += gap
+                return  # Let the real poller evaluate this silent interval.
+            release.set()
+            super().join(timeout=3)
+
+    monkeypatch.setattr(h, "threading", SimpleNamespace(
+        Thread=ClockedPollThread, Lock=threading.Lock, get_ident=threading.get_ident))
+    kwargs = {"model": "gpt-6.1-sol", "input": "bounded synthetic request"}
+    if reasoning is not None:
+        kwargs["reasoning"] = {"effort": reasoning}
+    try:
+        response = h.interruptible_api_call(agent, kwargs)
+        assert response is sentinel
+        return closes
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("effort", ["high", "xhigh"])
+def test_reasoning_stream_survives_observed_seventeen_second_silence(tmp_path, monkeypatch, effort):
+    closes = _run_clocked_event_silence(tmp_path, monkeypatch, gap=17.04, reasoning=effort)
+    assert "codex_stream_idle_kill" not in closes
+
+
+@pytest.mark.parametrize("effort", [None, "none", "low", "medium"])
+def test_small_low_or_no_reasoning_stream_retains_short_stall_detection(tmp_path, monkeypatch, effort):
+    with pytest.raises(TimeoutError, match="after first byte"):
+        _run_clocked_event_silence(tmp_path, monkeypatch, gap=17.04, reasoning=effort)
+
+
+def test_reasoning_stream_true_stall_preserves_watchdog_cause_over_abort_read_error(tmp_path, monkeypatch):
+    import httpx
+    with pytest.raises(TimeoutError, match="after first byte") as caught:
+        _run_clocked_event_silence(tmp_path, monkeypatch, gap=61, reasoning="xhigh")
+    assert isinstance(caught.value.__cause__, httpx.ReadError)
+
+
+@pytest.mark.parametrize("context_tokens,gap", [(50_001, 119), (100_001, 179)])
+def test_reasoning_floor_never_shortens_larger_context_idle_window(tmp_path, monkeypatch, context_tokens, gap):
+    closes = _run_clocked_event_silence(tmp_path, monkeypatch, gap=gap, reasoning="xhigh",
+                                      context_tokens=context_tokens)
+    assert "codex_stream_idle_kill" not in closes
+
+
+def test_explicit_short_reasoning_idle_override_remains_authoritative(tmp_path, monkeypatch):
+    with pytest.raises(TimeoutError, match="after first byte"):
+        _run_clocked_event_silence(tmp_path, monkeypatch, gap=3, reasoning="xhigh", override=2)
+
+
+@pytest.mark.parametrize("override", [0, -1])
+def test_explicit_reasoning_idle_disable_survives_long_silence(tmp_path, monkeypatch, override):
+    closes = _run_clocked_event_silence(tmp_path, monkeypatch, gap=61, reasoning="xhigh", override=override)
+    assert "codex_stream_idle_kill" not in closes

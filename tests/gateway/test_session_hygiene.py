@@ -554,7 +554,7 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
     runner._pending_approvals = {}
     runner._session_db = None
     runner._is_user_authorized = lambda _source: True
-    runner._set_session_env = lambda _context: None
+    runner._set_session_env = lambda _context, **_kwargs: None
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",

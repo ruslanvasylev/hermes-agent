@@ -108,7 +108,7 @@ def test_openrouter_still_prepends_vendor():
 # ---------------------------------------------------------------------------
 
 
-def _run_switch(raw_input: str, **extra):
+def _run_switch(raw_input: str, *, validation_catalog=None, **extra):
     """Call switch_model with opencode-go as current provider, mocking the
     live catalog so the test doesn't hit the network."""
     defaults = dict(
@@ -126,10 +126,13 @@ def _run_switch(raw_input: str, **extra):
         # For other providers, return empty so tests don't depend on them.
         return []
 
+    # Validation has a separate /models probe. Pin that seam too: a live
+    # provider catalog can rename a model even after our routing fixture matched.
+    api_models = _OPENCODE_GO_LIVE if validation_catalog is None else validation_catalog
     with patch(
         "hermes_cli.model_switch.list_provider_models",
         side_effect=fake_list_provider_models,
-    ):
+    ), patch("hermes_cli.models.fetch_api_models", return_value=list(api_models)):
         return switch_model(raw_input=raw_input, **defaults)
 
 
@@ -157,3 +160,13 @@ def test_kimi_k2_6_stays_on_opencode_go():
     result = _run_switch("kimi-k2.6", current_model="deepseek-v4-pro")
     assert result.target_provider == "opencode-go"
     assert result.new_model == "kimi-k2.6"
+
+
+def test_catalog_correction_preserves_opencode_go_routing():
+    """Real validation may correct a model while retaining the chosen provider."""
+    result = _run_switch(
+        "deepseek-v4-flash", validation_catalog=["deepseek-v4.1-flash"],
+    )
+    assert result.success
+    assert result.target_provider == "opencode-go"
+    assert result.new_model == "deepseek-v4.1-flash"

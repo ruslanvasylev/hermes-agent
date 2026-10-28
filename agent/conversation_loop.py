@@ -333,7 +333,10 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
     # First turn of a new session (or recovering from a broken stored
     # prompt) — build from scratch.
-    agent._cached_system_prompt = agent._build_system_prompt(system_message)
+    from agent.prompt_construction import capture_prompt
+    with capture_prompt(agent, system_message, conversation_history) as construction:
+        agent._cached_system_prompt = agent._build_system_prompt(system_message)
+        construction.complete(agent._cached_system_prompt)
 
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
@@ -1058,6 +1061,8 @@ def run_conversation(
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
                     api_kwargs = agent._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
+                    from agent.prompt_construction import note_api_construction
+                    note_api_construction(agent, api_messages, api_kwargs)
                 try:
                     from hermes_cli.middleware import apply_llm_request_middleware
 

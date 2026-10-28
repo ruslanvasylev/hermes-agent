@@ -282,3 +282,49 @@ print(json.dumps({"status":status,"persistent_file_changes":0}))
     report = json.loads(result.stdout.splitlines()[-1])
     assert report["status"] in {"constructed", "unavailable"}
     assert report["persistent_file_changes"] == 0
+
+
+def test_preexisting_audit_registration_veto_refuses_before_scoped_write(tmp_path):
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    home = tmp_path / "home"
+    hermes = home / "hermes"
+    hermes.mkdir(parents=True)
+    (hermes / "SOUL.md").write_text("Keep the native identity.\n")
+    code = r'''
+import sys,json,os
+from pathlib import Path
+from agent.prompt_inspection_scope import prompt_source_inspection,PromptSourceUnavailable
+root=Path(os.environ["HERMES_HOME"])
+def veto(event,args):
+    if event=="sys.addaudithook":raise RuntimeError("veto new audit registration")
+sys.addaudithook(veto)
+try:
+    with prompt_source_inspection():
+        (root/"must-not-exist").write_text("would be an unguarded write")
+except PromptSourceUnavailable:
+    refused=True
+else:
+    refused=False
+assert refused and not (root/"must-not-exist").exists()
+print(json.dumps({"refused":refused,"scoped_write":False}))
+'''
+    result = subprocess.run([sys.executable, "-B", "-c", code], cwd=Path(__file__).resolve().parents[2],
+                            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home),
+                                 "HERMES_HOME": str(hermes), "PYTHONDONTWRITEBYTECODE": "1"},
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout.splitlines()[-1])["refused"]
+
+
+@pytest.mark.parametrize("event", ["os.fork", "os.forkpty"])
+def test_fork_events_refuse_without_creating_a_child(event):
+    import sys
+    from agent.prompt_inspection_scope import PromptSourceUnavailable, prompt_source_inspection
+
+    with prompt_source_inspection(), pytest.raises(PromptSourceUnavailable):
+        sys.audit(event)

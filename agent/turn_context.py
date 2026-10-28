@@ -208,6 +208,9 @@ def build_turn_context(
     turn_id = f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
+    from agent.prompt_construction import note_turn
+    note_turn(agent, turn_id, user_message=user_message, system_message=system_message,
+              conversation_history=conversation_history)
 
     # Reset retry counters and iteration budget at the start of each turn.
     agent._invalid_tool_retries = 0

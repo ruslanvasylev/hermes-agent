@@ -287,6 +287,9 @@ def init_agent(
     """
     _install_safe_stdio()
 
+    from agent.prompt_construction import begin_constructor
+    begin_constructor(agent)
+
     agent.model = model
     agent.max_iterations = max_iterations
     # Shared iteration budget — parent creates, children inherit.
@@ -1864,6 +1867,8 @@ def init_agent(
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
 
+    from agent.prompt_construction import finish_constructor
+    finish_constructor(agent)
 
 
 __all__ = ["init_agent"]

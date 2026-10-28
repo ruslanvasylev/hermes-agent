@@ -110,7 +110,7 @@ def _resolve_platform_hint(agent: Any, platform_key: str, default_hint: str) -> 
     return base
 
 
-def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
+def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None, *, helpers=None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered parts.
 
     Returns a dict with three keys:
@@ -131,7 +131,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Local import to avoid pulling model_tools at module load.  Tests
     # patch ``run_agent.get_toolset_for_tool`` and similar helpers, so
     # we resolve through ``_ra()`` to honor those patches.
-    _r = _ra()
+    _r = _ra() if helpers is None else helpers
 
     # Resolve the model's context window once so context-file caps can scale
     # to it (dynamic cap — see prompt_builder._dynamic_context_file_max_chars).
@@ -467,7 +467,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     }
 
 
-def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str:
+def build_system_prompt(agent: Any, system_message: Optional[str] = None, *, helpers=None) -> str:
     """Assemble the full system prompt from all layers.
 
     Called once per session (cached on ``agent._cached_system_prompt``) and
@@ -482,7 +482,7 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     mid-session, which is the only way to keep upstream prompt caches
     warm across turns.
     """
-    parts = build_system_prompt_parts(agent, system_message=system_message)
+    parts = build_system_prompt_parts(agent, system_message=system_message, helpers=helpers)
     joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
 
     # Surface context-file truncation warnings through the normal agent status

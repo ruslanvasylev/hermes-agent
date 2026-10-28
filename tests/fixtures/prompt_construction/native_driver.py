@@ -169,9 +169,10 @@ with tempfile.TemporaryDirectory() as directory:
             modified = handle.expected_request()
             modified["instructions"] = "caller-edited copy"
             assert handle.expected_request()["instructions"] == view.instructions
-            results["full_request_equal"] = True
+            results["complete_model_input_equal"] = True
         else:
-            assert expected != request
+            model_input = lambda value: {key: item for key, item in value.items() if key not in {"timeout", "stream", "extra_headers"}}
+            assert model_input(expected) != model_input(request)
             assert expected["instructions"] == view.instructions
             results["foreign_request_refused_by_comparison"] = True
         raise StoppedBeforeProvider()
@@ -186,7 +187,7 @@ with tempfile.TemporaryDirectory() as directory:
                 request["instructions"] = "arbitrary initial instructions"
             else:
                 request["input"].append({"role": "assistant", "content": [{"type": "output_text", "text": "foreign history"}]})
-            return request
+            return {"request": request}
         context.register_middleware("llm_request", mutation)
     if CASE == "foreign_callback":
         run_agent.build_nous_subscription_prompt = lambda *_args, **_kwargs: "unissued callback approval"

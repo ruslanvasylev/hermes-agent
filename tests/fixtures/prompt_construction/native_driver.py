@@ -84,7 +84,7 @@ with tempfile.TemporaryDirectory() as directory:
         return False
 
     invalid_cases = {"prefill", "ephemeral", "custom_context", "custom_system", "history", "foreign_callback", "registration_veto"}
-    request_mutations = {"changed_profile_callback", "changed_profile_data", "changed_profile_registry", "changed_message_converter", "changed_tools_converter", "changed_request_config", "changed_converter_data", "changed_transport_callback", "spoofed_stdlib_converter", "builtin_tools_converter"}
+    request_mutations = {"changed_profile_callback", "changed_profile_data", "changed_profile_registry", "changed_message_converter", "changed_tools_converter", "changed_request_config", "changed_converter_data", "changed_transport_callback", "spoofed_stdlib_converter", "builtin_tools_converter", "foreign_profile_receiver", "foreign_agent_receiver"}
     mutations = {"changed_soul", "changed_auth", "changed_config", "changed_tools", "changed_environment", "changed_cached_prompt"}
     actual_cases = {"native_request", "mutated_initial_instructions", "extra_assistant_input"}
     observed = {}
@@ -133,6 +133,15 @@ with tempfile.TemporaryDirectory() as directory:
             import agent.codex_responses_adapter as adapter
             if CASE == "changed_profile_callback":
                 providers.get_provider_profile = lambda _name: SimpleNamespace(build_api_kwargs_extras=lambda **_kwargs: ({}, {"reasoning": {"effort": "low"}}))
+            elif CASE == "foreign_profile_receiver":
+                from types import MethodType
+                from providers.base import ProviderProfile
+                profile = providers.get_provider_profile("openai-codex")
+                profile.get_max_tokens = MethodType(ProviderProfile.get_max_tokens, ProviderProfile(name="foreign", default_max_tokens=7))
+            elif CASE == "foreign_agent_receiver":
+                from types import MethodType
+                target = SimpleNamespace(_content_has_image_parts=agent._content_has_image_parts)
+                agent._prepare_messages_for_non_vision_model = MethodType(AIAgent._prepare_messages_for_non_vision_model, target)
             elif CASE == "changed_profile_data":
                 providers.get_provider_profile("openai-codex").default_max_tokens = 7
             elif CASE == "changed_profile_registry":

@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
     "changed_tools", "changed_environment", "changed_cached_prompt", "prefill", "ephemeral", "custom_context",
     "custom_system", "history", "foreign_callback", "registration_veto", "native_request",
     "mutated_initial_instructions", "extra_assistant_input", "fork_snapshot", "changed_profile_callback", "changed_profile_data",
-    "changed_profile_registry", "changed_message_converter", "changed_tools_converter", "changed_request_config", "changed_converter_data", "changed_transport_callback", "spoofed_stdlib_converter", "builtin_tools_converter"])
+    "changed_profile_registry", "changed_message_converter", "changed_tools_converter", "changed_request_config", "changed_converter_data", "changed_transport_callback", "spoofed_stdlib_converter", "builtin_tools_converter", "foreign_profile_receiver", "foreign_agent_receiver"])
 def test_real_native_issued_epoch_and_closed_construction(case):
     run = subprocess.run([sys.executable, "-I", "-B", str(ROOT / "tests/fixtures/prompt_construction/native_driver.py"), case],
         env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": "/tmp", "PYTHONDONTWRITEBYTECODE": "1"},

@@ -58,6 +58,9 @@ def _profile():
     profile = providers.get_provider_profile("openai-codex")
     if type(profile) is not ProviderProfile:
         n._fail()
+    if any(getattr(getattr(profile, name), "__self__", None) is not profile
+           for name in ("build_api_kwargs_extras", "get_max_tokens")):
+        n._fail()
     callbacks = [n._qualified(profile.build_api_kwargs_extras, {"providers/base.py:ProviderProfile.build_api_kwargs_extras"}),
                  n._qualified(profile.get_max_tokens, {"providers/base.py:ProviderProfile.get_max_tokens"})]
     # These are the base profile's request-bearing data. Auth/header fields are
@@ -74,12 +77,17 @@ def _state(agent):
 
 def _methods(agent):
     n = _native()
+    if any(getattr(getattr(agent, name), "__self__", None) is not agent
+           for name in _METHODS if name != "_content_has_image_parts"):
+        n._fail()
     owners = [n._qualified(getattr(agent, name), {"run_agent.py:AIAgent." + name}) for name in _METHODS]
     from agent.transports.codex import ResponsesApiTransport
     transport = agent._get_transport()
     if type(transport) is not ResponsesApiTransport or set(vars(transport)) - {"_last_issuer_kind"}:
         n._fail()
     for name in ("build_kwargs", "preflight_kwargs", "_resolve_issuer_kind"):
+        if getattr(getattr(transport, name), "__self__", None) is not transport:
+            n._fail()
         owners.append(n._qualified(getattr(transport, name), {"agent/transports/codex.py:ResponsesApiTransport." + name}))
     return owners
 

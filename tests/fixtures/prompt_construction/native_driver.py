@@ -84,6 +84,7 @@ with tempfile.TemporaryDirectory() as directory:
         return False
 
     invalid_cases = {"prefill", "ephemeral", "custom_context", "custom_system", "history", "foreign_callback", "registration_veto"}
+    request_mutations = {"changed_profile_callback", "changed_profile_data", "changed_profile_registry", "changed_message_converter", "changed_tools_converter", "changed_request_config", "changed_converter_data", "changed_transport_callback", "spoofed_stdlib_converter", "builtin_tools_converter"}
     mutations = {"changed_soul", "changed_auth", "changed_config", "changed_tools", "changed_environment", "changed_cached_prompt"}
     actual_cases = {"native_request", "mutated_initial_instructions", "extra_assistant_input"}
     observed = {}
@@ -123,9 +124,40 @@ with tempfile.TemporaryDirectory() as directory:
             assert rejected(lambda: pickle.dumps(handle))
             assert rejected(lambda: construction._reconstruct({"accepted": True}))
             assert rejected(lambda: construction._reconstruct(SimpleNamespace(accepted=True)))
+            prior = handle.expected_request()
             construction.note_api_construction(agent, [], {"accepted": True})
-            assert rejected(handle.expected_request)
+            assert handle.expected_request() == prior
             results["forgeries_refused"] = True
+        if CASE in request_mutations:
+            import providers
+            import agent.codex_responses_adapter as adapter
+            if CASE == "changed_profile_callback":
+                providers.get_provider_profile = lambda _name: SimpleNamespace(build_api_kwargs_extras=lambda **_kwargs: ({}, {"reasoning": {"effort": "low"}}))
+            elif CASE == "changed_profile_data":
+                providers.get_provider_profile("openai-codex").default_max_tokens = 7
+            elif CASE == "changed_profile_registry":
+                from providers.base import ProviderProfile
+                providers._REGISTRY["openai-codex"] = ProviderProfile(name="openai-codex", api_mode="codex_responses")
+            elif CASE == "changed_message_converter":
+                adapter._chat_messages_to_responses_input = lambda *_args, **_kwargs: [{"role": "user", "content": "foreign"}]
+            elif CASE == "spoofed_stdlib_converter":
+                import urllib.parse
+                namespace = {"original": adapter._chat_messages_to_responses_input}
+                exec(compile("def convert(*args, **kwargs): return original(*args, **kwargs)", urllib.parse.__file__, "exec"), namespace)
+                adapter._chat_messages_to_responses_input = namespace["convert"]
+            elif CASE == "builtin_tools_converter":
+                adapter._responses_tools = list
+            elif CASE == "changed_tools_converter":
+                adapter._responses_tools = lambda *_args, **_kwargs: [{"type": "function", "name": "foreign"}]
+            elif CASE == "changed_converter_data":
+                adapter._RESPONSES_BUILTIN_TOOL_TYPES = adapter._RESPONSES_BUILTIN_TOOL_TYPES | {"foreign"}
+            elif CASE == "changed_transport_callback":
+                agent._get_transport().build_kwargs = lambda **_kwargs: handle.expected_request()
+            else:
+                agent.reasoning_config = {"effort": "low"}
+            assert rejected(handle.expected_request)
+            results["changed_request_dependency_refused"] = True
+            raise StoppedBeforeProvider()
         if CASE in mutations:
             if CASE == "changed_soul":
                 old = soul.stat()
@@ -158,7 +190,8 @@ with tempfile.TemporaryDirectory() as directory:
             proof = handle.request_proof()
         finally:
             inspecting = False
-        assert proof["scope"].startswith("native_builder_preflight")
+        assert proof["schema_version"] == 2
+        assert proof["scope"].startswith("native_epoch_frozen_request")
         if CASE == "native_request":
             model_input = lambda value: {key: item for key, item in value.items() if key not in {"timeout", "stream", "extra_headers"}}
             if model_input(expected) != model_input(request):
@@ -177,7 +210,13 @@ with tempfile.TemporaryDirectory() as directory:
             results["foreign_request_refused_by_comparison"] = True
         raise StoppedBeforeProvider()
 
-    context.register_hook("on_session_start", started)
+    def guarded_started(**event):
+        try:
+            return started(**event)
+        except Exception as error:
+            results["unexpected_inspection_failure"] = type(error).__name__
+            raise StoppedBeforeProvider("inspection control failed") from error
+    context.register_hook("on_session_start", guarded_started)
     if CASE in actual_cases:
         context.register_middleware("llm_execution", execution)
     if CASE in {"mutated_initial_instructions", "extra_assistant_input"}:
@@ -201,11 +240,16 @@ with tempfile.TemporaryDirectory() as directory:
         kwargs["system_message"] = "custom unqualified context"
     if CASE == "history":
         kwargs["conversation_history"] = [{"role": "assistant", "content": "foreign history"}]
+    def unexpected_client(*_args, **_kwargs):
+        results["unexpected_client_entry"] = True
+        raise StoppedBeforeProvider("unexpected provider client entry")
+    agent._create_request_openai_client = unexpected_client
     try:
         agent.run_conversation("Native cron job prompt and selected data.", **kwargs)
     except StoppedBeforeProvider:
         pass
     assert results["phase"] is not None
+    assert not results.get("unexpected_client_entry"), results
     assert network_attempts == [], network_attempts
     assert inspection_events == [], inspection_events
     if CASE in actual_cases:

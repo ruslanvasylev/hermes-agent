@@ -258,3 +258,14 @@ For NeMo Relay adaptive execution middleware, see
   approvals evaluate.
 - Observer hooks remain the right place for read-only telemetry. Use middleware
   only when a plugin needs to alter or wrap behavior.
+
+### Context compression execution intent
+
+Before compression resolves or probes any auxiliary model/client, the native
+compression owner invokes the existing `llm_execution` chain with
+`execution_kind="context_compression"`, the original `messages` and
+`system_message`, and the owning session/turn/provider context. This is a
+transform intent, not a provider API request or a completion witness. Calling
+`next_call` permits native compression to continue; short-circuiting preserves
+the original messages and cached system prompt without auxiliary execution.
+With no refusing middleware, existing compression behavior is unchanged.

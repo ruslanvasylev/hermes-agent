@@ -12,7 +12,6 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
-import inspect
 import json
 import os
 from pathlib import Path
@@ -254,7 +253,8 @@ def note_turn(agent, turn_id, *, user_message, system_message, conversation_hist
                     or conversation_history or not isinstance(user_message, str)
                     or getattr(agent, "_cached_system_prompt", None) is not None):
                 return
-            row["turn"] = {"id": turn_id, "user_message_sha256": hashlib.sha256(user_message.encode()).hexdigest()}
+            row["turn"] = {"id": turn_id, "user_message_sha256": hashlib.sha256(user_message.encode()).hexdigest(),
+                           "user_message": user_message}
     except Exception:
         return
 
@@ -285,16 +285,20 @@ class PromptConstructionSnapshot:
         row = _current(self)
         if "request" not in row:
             _fail()
+        from agent.request_construction import replay_request
+        replay_request(row["agent"](), row["request_epoch"])
         return deepcopy(row["request"])
 
     def request_proof(self):
         row = _current(self)
         if "request" not in row:
             _fail()
-        return {"schema_version": 1, "epoch": row["epoch"], "turn_id": row["turn"]["id"],
+        return {"schema_version": 2, "epoch": row["epoch"], "turn_id": row["turn"]["id"],
+                "request_epoch_sha256": row["request_epoch"]["identity_sha256"],
+                "native_context_length": row["state"]["context_length"],
                 "request_sha256": row["request_sha256"], "code_owners": deepcopy(row["request_code_owners"]),
                 "source_fingerprints_sha256": _hash(row["request_sources"]),
-                "scope": "native_builder_preflight_before_request_middleware_not_first_incoming_request"}
+                "scope": "native_epoch_frozen_request_replayed_before_external_hooks_not_first_preflight"}
 
 
 class _Capture:
@@ -331,6 +335,13 @@ class _Capture:
                    "turn": deepcopy(self.constructor["turn"]), "state": state, "rows": deepcopy(self.rows),
                    "sources": dict(self.sources), "codes": dict(self.codes), "instructions_sha256": _text_hash(prompt),
                    "environment": self.constructor["environment"], "processes": deepcopy(self.processes)}
+            from agent.request_construction import freeze_request
+            request_epoch = freeze_request(agent, prompt, self.constructor["turn"]["user_message"])
+            row["sources"] = dict(self.sources)
+            row.update(request_epoch=request_epoch, request=deepcopy(request_epoch["request"]),
+                       request_sha256=_hash(request_epoch["request"]),
+                       request_model_sha256=request_epoch["model_sha256"],
+                       request_code_owners=request_epoch["code_owners"], request_sources=request_epoch["sources"])
             with _LOCK:
                 _SNAPSHOTS[handle] = row
                 key = (state["session_id"], row["turn"]["id"])
@@ -394,6 +405,9 @@ def capture_prompt(agent, system_message, conversation_history):
                 capture = _Capture(agent, constructor)
     except Exception:
         pass
+    if isinstance(capture, _Capture):
+        from agent.request_construction import prepare_request_dependencies
+        prepare_request_dependencies()
     token = _CAPTURE.set(capture if isinstance(capture, _Capture) else None)
     try:
         if isinstance(capture, _Capture):
@@ -548,34 +562,17 @@ def note_api_construction(agent, api_messages, api_kwargs):
                 or not isinstance(api_kwargs, dict) or api_kwargs.get("instructions") != view.instructions
                 or agent.api_mode != "codex_responses" or agent.provider != "openai-codex"):
             return
-        from agent import chat_completion_helpers
-        from agent.transports.codex import ResponsesApiTransport
-        from agent import codex_responses_adapter
-        transport = agent._get_transport()
-        if type(transport) is not ResponsesApiTransport:
-            return
-        owners = [
-            _qualified(agent._build_api_kwargs, {"run_agent.py:AIAgent._build_api_kwargs"}),
-            _qualified(chat_completion_helpers.build_api_kwargs, {"agent/chat_completion_helpers.py:build_api_kwargs"}),
-            _qualified(transport.build_kwargs, {"agent/transports/codex.py:ResponsesApiTransport.build_kwargs"}),
-            _qualified(transport.preflight_kwargs, {"agent/transports/codex.py:ResponsesApiTransport.preflight_kwargs"}),
-            _qualified(codex_responses_adapter._preflight_codex_api_kwargs,
-                       {"agent/codex_responses_adapter.py:_preflight_codex_api_kwargs"}),
-        ]
-        source = deepcopy(api_kwargs)
-        request_hash = _hash(source)
-        model_hash = _hash({key: value for key, value in source.items() if key not in {"timeout", "stream", "extra_headers"}})
-        with _LOCK:
-            if "request" in row and row["request_model_sha256"] != model_hash:
-                row.pop("request", None)
-                row["request_changed"] = True
-                return
-            if row.get("request_changed"):
-                return
-            request_sources = {str((_ROOT / owner["owner"].split(":", 1)[0]).resolve()):
-                               _fingerprint(_ROOT / owner["owner"].split(":", 1)[0]) for owner in owners}
-            if "request" not in row:
-                row.update(request=source, request_sha256=request_hash, request_model_sha256=model_hash,
-                           request_code_owners=owners, request_sources=request_sources)
+        from agent.request_construction import replay_request
+        replay_request(agent, row["request_epoch"])
+        model_hash = _hash({key: value for key, value in api_kwargs.items()
+                            if key not in {"timeout", "stream", "extra_headers"}})
+        if model_hash != row["request_model_sha256"]:
+            row["request_changed"] = True
+        if row.get("request_changed"):
+            row.pop("request", None)
     except Exception:
+        # An invalid preflight cannot retain an earlier qualified request.
+        if "row" in locals():
+            row.pop("request", None)
+            row["request_changed"] = True
         return

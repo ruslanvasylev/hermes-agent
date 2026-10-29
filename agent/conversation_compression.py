@@ -424,6 +424,28 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    # Compression can resolve a separate model/client before the main request
+    # reaches its execution middleware. Give the same registered execution
+    # owners a veto before any auxiliary feasibility/auth/provider work. This
+    # envelope is a transform intent, never a provider request or admission.
+    from hermes_cli.middleware import run_llm_execution_middleware
+    allowed = object()
+    result = run_llm_execution_middleware(
+        {"messages": messages, "system_message": system_message},
+        lambda _request: allowed,
+        execution_kind="context_compression",
+        session_id=getattr(agent, "session_id", "") or "",
+        turn_id=getattr(agent, "_current_turn_id", "") or "",
+        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+        platform=getattr(agent, "platform", "") or "",
+        provider=getattr(agent, "provider", "") or "",
+        model=getattr(agent, "model", "") or "",
+        base_url=getattr(agent, "base_url", "") or "",
+        api_mode=getattr(agent, "api_mode", "") or "",
+    )
+    if result is not allowed:
+        return messages, getattr(agent, "_cached_system_prompt", system_message)
+
     # Lazy feasibility check — run the auxiliary-provider probe + context
     # length lookup just-in-time on the first compression attempt instead of
     # at AIAgent.__init__. Saves ~400ms cold off every short session that

@@ -2516,6 +2516,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 job_id, _mcp_exc,
             )
 
+        from agent.prompt_state import cron_prompt_options
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -2541,10 +2543,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             # HERMES_HOME. When a workdir is configured, also inject project
             # context files (AGENTS.md / CLAUDE.md / .cursorrules) from there.
             # Without a workdir, keep cwd context discovery disabled.
-            skip_context_files=not bool(_job_workdir),
-            load_soul_identity=True,
-            skip_memory=True,  # Cron system prompts would corrupt user representations
-            platform="cron",
+            **cron_prompt_options(workdir_present=bool(_job_workdir)),
             session_id=_cron_session_id,
             session_db=_session_db,
             api_max_attempts=job.get("api_max_attempts"),

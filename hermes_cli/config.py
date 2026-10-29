@@ -847,6 +847,13 @@ def ensure_hermes_home():
     any files created (e.g. SOUL.md) are group-writable (0660).
     """
     home = get_hermes_home()
+    from agent.prompt_inspection_scope import PromptSourceUnavailable, prompt_source_inspection_active
+    if prompt_source_inspection_active():
+        # Normal preparation also seeds SOUL.md. Missing source cannot be
+        # silently replaced by the builder's different hardcoded fallback.
+        if not home.is_dir() or not (home / "SOUL.md").is_file():
+            raise PromptSourceUnavailable("native_prompt_profile_uninitialized")
+        return
     if is_managed():
         old_umask = os.umask(0o007)
         try:

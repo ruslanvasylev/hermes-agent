@@ -16,7 +16,7 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _clean_inference_env(monkeypatch):
+def _clean_inference_env(tmp_path, monkeypatch):
     """Strip credential-shaped env vars so the pool is the only source."""
     for key in (
         "OPENROUTER_API_KEY",
@@ -26,8 +26,19 @@ def _clean_inference_env(monkeypatch):
         "CLAUDE_CODE_OAUTH_TOKEN",
         "NOUS_API_KEY",
         "HERMES_INFERENCE_PROVIDER",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
     ):
         monkeypatch.delenv(key, raising=False)
+    # The AWS SDK also reads shared files outside the isolated HERMES_HOME.
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "no-aws-credentials"))
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "no-aws-config"))
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
 
 
 def _seed_openrouter_pool(token: str = "sk-or-FAKEKEY123") -> None:

@@ -287,6 +287,9 @@ def init_agent(
     """
     _install_safe_stdio()
 
+    from agent.prompt_construction import begin_constructor
+    begin_constructor(agent)
+
     agent.model = model
     agent.max_iterations = max_iterations
     # Shared iteration budget — parent creates, children inherit.
@@ -1041,9 +1044,9 @@ def init_agent(
     )
     
     # Show tool configuration and store valid tool names for validation
-    agent.valid_tool_names = set()
+    from agent.prompt_state import apply_prompt_tools
+    apply_prompt_tools(agent, agent.tools)
     if agent.tools:
-        agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
         tool_names = sorted(agent.valid_tool_names)
         if not agent.quiet_mode:
             print(f"🛠️  Loaded {len(agent.tools)} tools: {', '.join(tool_names)}")
@@ -1054,17 +1057,6 @@ def init_agent(
                 print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
     elif not agent.quiet_mode:
         print("🛠️  No tools loaded (all tools filtered out or unavailable)")
-
-    # Kanban worker/orchestrator lifecycle guidance is session-static:
-    # the dispatcher decides at spawn time whether this process is a kanban
-    # worker (kanban_show tool is present iff HERMES_KANBAN_TASK is set).
-    # Resolving the ~835-token block once here avoids re-running the
-    # membership test + reference on every system-prompt rebuild
-    # (init + each context compression).
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
-    )
 
     # Check tool requirements
     if agent.tools and not agent.quiet_mode:
@@ -1305,48 +1297,14 @@ def init_agent(
     _agent_section = _agent_cfg.get("agent", {})
     if not isinstance(_agent_section, dict):
         _agent_section = {}
-    agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
+    from agent.prompt_state import apply_prompt_configuration
+    apply_prompt_configuration(agent, _agent_cfg)
 
     # Intent-ack continuation config: "auto" (default — codex_responses only,
     # the historical gate), true (all api_modes), false (never), or a list of
     # model-name substrings.  Resolved against the active api_mode/model in the
     # conversation loop's intent-ack block.
     agent._intent_ack_continuation = _agent_section.get("intent_ack_continuation", "auto")
-
-    # Universal task-completion guidance toggle.  Default True.  Surfaced
-    # as a separate flag from tool_use_enforcement because the guidance
-    # applies to ALL models, not just the model families enforcement
-    # targets.
-    agent._task_completion_guidance = bool(_agent_section.get("task_completion_guidance", True))
-
-    # Universal parallel-tool-call guidance toggle.  Default True.  Separate
-    # flag from task_completion_guidance because a user may want one but not
-    # the other.  Steers the model to batch independent tool calls into a
-    # single turn; the runtime already executes such batches concurrently.
-    agent._parallel_tool_call_guidance = bool(_agent_section.get("parallel_tool_call_guidance", True))
-
-    # Local Python toolchain probe toggle.  Default True.  When False,
-    # the probe is skipped entirely (no subprocess calls, no system-prompt
-    # line).  Useful for users on exotic setups where the probe heuristics
-    # are noisy.
-    agent._environment_probe = bool(_agent_section.get("environment_probe", True))
-
-    # Per-platform prompt-hint overrides (config.yaml → platform_hints).
-    # Lets an enterprise admin append to or replace Hermes' built-in
-    # platform hint for a single messaging platform (e.g. WhatsApp) without
-    # affecting other platforms. Shape:
-    #   platform_hints:
-    #     whatsapp:
-    #       append: "When tabular output would help, invoke the ... skill."
-    #     slack:
-    #       replace: "Custom Slack hint that fully replaces the default."
-    # Stored verbatim; resolution happens in agent/system_prompt.py against
-    # the active platform. Invalid shapes are ignored defensively so a bad
-    # config entry can never break prompt assembly.
-    _platform_hints_cfg = _agent_cfg.get("platform_hints", {})
-    if not isinstance(_platform_hints_cfg, dict):
-        _platform_hints_cfg = {}
-    agent._platform_hint_overrides = _platform_hints_cfg
 
     # App-level API retry count (wraps each model API call).  Default 3,
     # overridable via agent.api_max_retries in config.yaml.  Provider profiles
@@ -1909,6 +1867,8 @@ def init_agent(
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
 
+    from agent.prompt_construction import finish_constructor
+    finish_constructor(agent)
 
 
 __all__ = ["init_agent"]

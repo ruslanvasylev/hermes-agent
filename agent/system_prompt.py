@@ -110,7 +110,7 @@ def _resolve_platform_hint(agent: Any, platform_key: str, default_hint: str) -> 
     return base
 
 
-def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
+def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None, *, helpers=None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered parts.
 
     Returns a dict with three keys:
@@ -131,7 +131,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Local import to avoid pulling model_tools at module load.  Tests
     # patch ``run_agent.get_toolset_for_tool`` and similar helpers, so
     # we resolve through ``_ra()`` to honor those patches.
-    _r = _ra()
+    _r = _ra() if helpers is None else helpers
+    from agent.prompt_construction import dependency as _dep
 
     # Resolve the model's context window once so context-file caps can scale
     # to it (dynamic cap — see prompt_builder._dynamic_context_file_max_chars).
@@ -152,7 +153,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # cwd project instructions disabled.
     _soul_loaded = False
     if agent.load_soul_identity or not agent.skip_context_files:
-        _soul_content = _r.load_soul_md(_ctx_len)
+        _soul_content = _dep("soul", _r.load_soul_md, _ctx_len)
         if _soul_content:
             stable_parts.append(_soul_content)
             _soul_loaded = True
@@ -218,7 +219,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         from agent.prompt_builder import computer_use_guidance
         stable_parts.append(computer_use_guidance())
 
-    nous_subscription_prompt = _r.build_nous_subscription_prompt(agent.valid_tool_names)
+    nous_subscription_prompt = _dep("subscription", _r.build_nous_subscription_prompt, agent.valid_tool_names)
     if nous_subscription_prompt:
         stable_parts.append(nous_subscription_prompt)
     # Tool-use enforcement: tells the model to actually call tools instead
@@ -262,7 +263,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         avail_toolsets = {
             toolset
             for toolset in (
-                _r.get_toolset_for_tool(tool_name) for tool_name in agent.valid_tool_names
+                _dep("toolset", _r.get_toolset_for_tool, tool_name) for tool_name in agent.valid_tool_names
             )
             if toolset
         }
@@ -274,12 +275,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         try:
             from agent.coding_context import coding_compact_skill_categories
 
-            _compact_cats = coding_compact_skill_categories(
-                platform=agent.platform, cwd=resolve_context_cwd()
+            _compact_cats = _dep("compact_skills", coding_compact_skill_categories,
+                platform=agent.platform, cwd=_dep("cwd", resolve_context_cwd)
             )
         except Exception:
             _compact_cats = frozenset()
-        skills_prompt = _r.build_skills_system_prompt(
+        skills_prompt = _dep("skills", _r.build_skills_system_prompt,
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
@@ -306,7 +307,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Environment hints (WSL, Termux, etc.) — tell the agent about the
     # execution environment so it can translate paths and adapt behavior.
     # Stable for the lifetime of the process.
-    _env_hints = _r.build_environment_hints()
+    _env_hints = _dep("environment", _r.build_environment_hints)
     if _env_hints:
         stable_parts.append(_env_hints)
 
@@ -320,9 +321,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             from agent.coding_context import coding_system_blocks
 
             stable_parts.extend(
-                coding_system_blocks(
+                _dep("coding", coding_system_blocks,
                     platform=agent.platform,
-                    cwd=resolve_context_cwd(),
+                    cwd=_dep("cwd", resolve_context_cwd),
                     model=agent.model,
                 )
             )
@@ -340,7 +341,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if getattr(agent, "_environment_probe", True):
         try:
             from tools.env_probe import get_environment_probe_line
-            _probe_line = get_environment_probe_line()
+            _probe_line = _dep("environment_probe", get_environment_probe_line)
             if _probe_line:
                 stable_parts.append(_probe_line)
         except Exception:
@@ -356,7 +357,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # for the matching tool-side guard.
     try:
         from agent.file_safety import _resolve_active_profile_name
-        active_profile = _resolve_active_profile_name()
+        active_profile = _dep("profile", _resolve_active_profile_name)
     except Exception:
         active_profile = "default"
     if active_profile == "default":
@@ -414,8 +415,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # CLI), None lets build_context_files_prompt fall back to the launch
         # dir — the user's real cwd there, but the install dir for the gateway
         # daemon, which is why the gateway sets TERMINAL_CWD.
-        context_files_prompt = _r.build_context_files_prompt(
-            cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
+        context_files_prompt = _dep("context", _r.build_context_files_prompt,
+            cwd=_dep("cwd", resolve_context_cwd), skip_soul=_soul_loaded,
             context_length=_ctx_len)
         if context_files_prompt:
             context_parts.append(context_files_prompt)
@@ -444,7 +445,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             pass
 
     from hermes_time import now as _hermes_now
-    now = _hermes_now()
+    now = _dep("time", _hermes_now)
     # Date-only (not minute-precision) so the system prompt is byte-stable
     # for the full day.  Minute-precision changes invalidate prefix-cache KV
     # on every rebuild path (compression boundary, fresh-agent gateway turns,
@@ -467,7 +468,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     }
 
 
-def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str:
+def build_system_prompt(agent: Any, system_message: Optional[str] = None, *, helpers=None) -> str:
     """Assemble the full system prompt from all layers.
 
     Called once per session (cached on ``agent._cached_system_prompt``) and
@@ -482,7 +483,7 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     mid-session, which is the only way to keep upstream prompt caches
     warm across turns.
     """
-    parts = build_system_prompt_parts(agent, system_message=system_message)
+    parts = build_system_prompt_parts(agent, system_message=system_message, helpers=helpers)
     joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
 
     # Surface context-file truncation warnings through the normal agent status

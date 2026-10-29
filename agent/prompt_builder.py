@@ -1311,6 +1311,11 @@ def _write_skills_snapshot(
     category_descriptions: dict[str, str],
 ) -> None:
     """Persist skill metadata to disk for fast cold-start reuse."""
+    from agent.prompt_inspection_scope import prompt_source_inspection_active
+    if prompt_source_inspection_active():
+        # Rendering still scans/reconciles the same native skill sources;
+        # inspection merely does not persist this optional derived cache.
+        return
     payload = {
         "version": _SKILLS_SNAPSHOT_VERSION,
         "manifest": manifest,

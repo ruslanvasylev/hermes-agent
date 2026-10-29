@@ -613,11 +613,20 @@ def _live_system_guard(request, monkeypatch):
             return False
         return False
 
+    spawned_children = {}
+
     real_kill = _os.kill
 
     def _guarded_kill(pid, sig, *args, **kwargs):
         if _is_own_subtree(int(pid)):
             return real_kill(pid, sig, *args, **kwargs)
+        # A child can exit between the psutil identity read and its parent
+        # walk. Only a Popen object issued by this fixture can establish that
+        # it was our child and has been reaped. Never send a signal in this
+        # case (especially if the numeric PID has since been reused).
+        owned_child = spawned_children.get(int(pid))
+        if owned_child is not None and owned_child.poll() is not None:
+            raise ProcessLookupError(f"owned test child {pid} has already exited")
         raise RuntimeError(
             f"tests/conftest.py live-system guard: blocked os.kill("
             f"{pid}, {sig}) — PID is outside the test process subtree. "
@@ -798,6 +807,7 @@ def _live_system_guard(request, monkeypatch):
             def __init__(self, cmd, *args, **kwargs):
                 _check_subprocess_cmd("Popen", cmd)
                 super().__init__(cmd, *args, **kwargs)
+                spawned_children[self.pid] = self
 
         _GuardedPopen.__name__ = "Popen"
         _GuardedPopen.__qualname__ = "Popen"
